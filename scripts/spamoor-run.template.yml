@@ -1,0 +1,46 @@
+# Rendered by Run-SpamoorTests.ps1: the double-brace placeholders are filled in per run.
+# The private key and the image registry ($env:IMAGE_REGISTRY) are injected at render
+# time and never written to the repo.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{NAME}}
+  namespace: {{NAMESPACE}}
+  labels:
+    app: spamoor
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nodekind
+      operator: Equal
+      value: besunode
+      effect: NoSchedule
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.azure.com/agentpool
+                operator: In
+                values:
+                  - besu
+    # Land on a besu node that has no besu pod on it
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values:
+                  - besu
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: spamoor
+      image: {{IMAGE}}
+      resources:
+        requests:
+          cpu: "40"
+          memory: 160Gi
+      args:
+{{ARGS}}

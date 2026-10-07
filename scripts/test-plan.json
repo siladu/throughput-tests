@@ -1,0 +1,17 @@
+{
+  "image": "spamoor:v1.2.3",
+  "namespace": "besu-consensus",
+  "validatorPod": "besu-node-validator-1-0",
+  "rpcUrl": "http://besu-node-rpc-1-0.besu-node-rpc-1.besu-consensus.svc.cluster.local:8545",
+  "scenario": "eoatx",
+  "slotDuration": "2s",
+  "resetNetwork": true,
+  "warmupSeconds": 60,
+  "cooldownSeconds": 60,
+  "sampleSeconds": 30,
+  "runs": [
+    { "name": "t2000", "durationMinutes": 10, "throughput": 2000, "amount": 50 },
+    { "name": "t4000", "durationMinutes": 10, "throughput": 4000, "amount": 50 },
+    { "name": "t8000", "durationMinutes": 10, "throughput": 8000, "amount": 50 }
+  ]
+}
