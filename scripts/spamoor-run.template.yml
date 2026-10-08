@@ -39,7 +39,7 @@ spec:
     - name: spamoor
       image: {{IMAGE}}
       resources:
-        requests:
+        limits:
           cpu: "40"
           memory: 160Gi
       args:
