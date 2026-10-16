@@ -14,13 +14,13 @@ There are two machines. Git carries scripts **one way only**, host → VDS:
 | VDS (Windows, PowerShell) | The user only | Yes (kubectl) | `git pull`, run tests |
 
 - **The VDS can't push to GitHub.** Results, logs and command output come back only as
-  screenshots or pasted text, so run zips won't normally appear in `runs/` on the host.
+  console output the user relays, so run zips won't normally appear in `runs/` on the host.
   When asking for data, ask for something that fits on a screen (counts, summaries,
   `Select-String` filtered log lines), not whole files.
 - You cannot run kubectl, PowerShell scripts or tests yourself. Nothing in `scripts/` is
   meant to run on the host.
 - When the user needs to do something on the VDS, give **copy-pasteable PowerShell** in a
-  single block. The user relays output back as pasted text or screenshots.
+  single block. The user relays the output back.
 - Folder ownership keeps the two sides from conflicting:
   - `scripts/` (and any analysis/docs): written on the host, pulled on the VDS.
   - `runs/`: written **only** by the VDS. Never edit, rename or delete files in `runs/`
@@ -65,8 +65,12 @@ Per run in `test-plan.json`:
 4. Render the template and apply the spamoor pod; wait for Ready.
 5. For `durationMinutes`, sample `kubectl top pods --containers` every `sampleSeconds`.
 6. Save spamoor's logs, delete its pod, keep logging for `cooldownSeconds` (txpool drain).
-7. Stop the stream, write `meta.json`, zip, copy into `runs/[<group>/]`, and with `-Push`
-   commit and push that zip only.
+7. Stop the stream, print a screen-sized summary (blocks and txs read from the chain,
+   tx/s achieved vs requested, CPU/memory, warnings), write `summary.txt` and `meta.json`,
+   zip, copy into `runs/[<group>/]`, and with `-Push` commit and push that zip only.
+
+After the last run it prints a table comparing every run in the batch. That table and
+the per-run summaries are normally what the user relays back for analysis.
 
 The run is built unzipped in `$HOME\spamoor-runs\[<group>\]<runId>\` on the VDS (outside
 the repo) and zipped there; only the zip goes into `runs/`. Point the user there rather
@@ -93,6 +97,8 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
 - `validator.log`: Besu logs from one validator, covering just that run, including the
   reset and health check.
 - `spamoor.log`: the load generator's own output.
+- `summary.txt`: the summary printed at the end of the run (also in `meta.json` as
+  `summary`).
 - `top.log`: `<UTC timestamp> <pod> <container> <cpu> <memory>` samples for every pod.
 - `meta.json`: parameters (incl. `group`, `resetNetwork`, `warmupSeconds`), UTC timestamps
   (`logStartUtc`, `healthyUtc`, `loadStartUtc`, `loadEndUtc`, `endUtc`), `health`
@@ -108,7 +114,11 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
 
 ## Analysing results
 
-- Unzip into a scratch location outside the repo (or a gitignored folder), never into `runs/`.
+- Usually the input is the console output of the per-run summaries and the batch table,
+  not the zips. Work from those; if a question needs more, give the user a PowerShell block
+  that pulls just that out of `$HOME\spamoor-runs\<group>\<runId>\` on the VDS.
+- If you do have zips, unzip them into a scratch location outside the repo (or a
+  gitignored folder), never into `runs/`.
 - Use `meta.json` timestamps to separate warmup, load and cooldown phases in the logs.
 - Check `health` in `meta.json`: runs that needed fix-up restarts started with a freshly
   restarted pod, so note them when comparing.

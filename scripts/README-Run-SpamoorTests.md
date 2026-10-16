@@ -4,8 +4,8 @@ Runs every load test listed in `test-plan.json`, one after another. For each run
 captures the validator's logs and CPU/memory samples, then zips the results into `runs/`
 and, with `-Push`, commits and pushes them. It runs on the VDS under Windows PowerShell 5.1.
 
-The VDS currently can't push to GitHub, so leave `-Push` off there and share results as
-screenshots or pasted output.
+The VDS currently can't push to GitHub, so leave `-Push` off there; the console output
+(per-run summaries and the batch table) carries the results.
 
 ```powershell
 git pull
@@ -22,8 +22,11 @@ For each entry in `test-plan.json`:
 ```
 [reset network] → health check (+ fix-ups) → start validator log stream → [warmup]
 → start spamoor → load + sample CPU/mem → save spamoor log, kill spamoor → cooldown
-→ stop stream → meta.json → zip → [git push]
+→ stop stream → summary → meta.json → zip → [git push]
 ```
+
+After the last run it prints a table comparing all runs in the batch. See
+[Run summary](#run-summary).
 
 Each run is wrapped so that a failure is written into that run's `meta.json` and the loop
 moves on to the next run.
@@ -227,6 +230,53 @@ unhealthy pods (every pod, for a stall) are saved as `unhealthy-<pod>.log`, and
 
 `meta.json` records `health`: `secondsToHealthy`, `fixups` (`reset` or the pod restarted,
 in order) and the final `peers` (pod names) and `heads` per pod.
+
+## Run summary
+
+Results can't come back through git (the VDS can't push), so after each run the script
+prints a summary that fits on one screen, and saves it as `summary.txt` and in
+`meta.json` (`summary`). Example:
+
+```
+  --- Summary: 20261016-140623-t2000 ---
+  Load 10.0 min: 300 blocks, avg 2.00 s, max gap 4 s
+  598,000 txs = 996.7 tx/s (requested 1,000 tx/s = 2000 per 2s slot); after first 2 min 1,000.1 tx/s
+  Tx/block avg 1,993, max 2000; gas used avg 41.9%, max 42.0%
+  Cooldown: 30 blocks, 0 txs (txpool empty at load end)
+  Health: healthy after 33 s; fix-ups: none
+  CPU cores max (avg), memory max during load:
+    rpc-1         0.95 (0.70)  1.7Gi
+    validator-1   0.98 (0.71)  1.8Gi
+    ...
+    spamoor       3.20 (2.50)  2.1Gi
+  validator restarts 0 -> 0; validator.log WARN 3, ERROR 0
+        3 x WARN RoundTimer | ...
+  spamoor.log error lines: 0
+```
+
+Where each figure comes from:
+
+- **Blocks and transactions**: read from the chain after cooldown, over RPC on
+  `validatorPod` (`eth_getBlockByNumber`, walking back from the head to the first block
+  stamped at or after `loadStartUtc`). The load window is `loadStartUtc`–`loadEndUtc`, by
+  block timestamp. This reads one block per call, so it takes roughly half a minute for a
+  10-minute run.
+- **Requested tx/s** is `throughput / slotDuration`, which assumes spamoor's `-t` is
+  transactions per slot. If tx/block sits near `throughput` while blocks keep to the slot
+  time, that assumption holds.
+- **"After first 2 min"** uses the same cut as the analysis rule in `CLAUDE.md` (spamoor
+  ramp-up, JVM warmup). It's only shown for load windows over 3 minutes.
+- **Cooldown** shows whether the txpool was still draining after the load stopped.
+- **CPU/memory**: `top.log` samples inside the load window. Besu's limit is 1 core and
+  2G, so a max near 1.00 cores means throttling and memory near 2Gi means OOM risk.
+- **Warnings/errors**: counts of `WARN`/`ERROR` in `validator.log` (the whole run, not
+  just the load), with the three most common messages (numbers and hashes blanked so
+  repeats group). `spamoor.log` lines containing "error".
+
+The end-of-batch table has one row per run: requested and achieved tx/s (also after the
+first 2 minutes), tx/block, average block time, max gap, the highest Besu CPU and memory
+(and which pod), and notes such as errors, fix-ups, restarts. If the summary itself
+fails, the run is still packaged and the table row says why.
 
 ## Cleanup and packaging
 
