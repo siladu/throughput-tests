@@ -4,6 +4,9 @@ Runs every load test listed in `test-plan.json`, one after another. For each run
 captures the validator's logs and CPU/memory samples, then zips the results into `runs/`
 and, with `-Push`, commits and pushes them. It runs on the VDS under Windows PowerShell 5.1.
 
+The VDS currently can't push to GitHub, so leave `-Push` off there and share results as
+screenshots or pasted output.
+
 ```powershell
 git pull
 .\scripts\Run-SpamoorTests.ps1                    # results go to runs\, not pushed
@@ -29,8 +32,8 @@ Timeline of one run and the `meta.json` timestamps. `validator.log` covers all o
 from `logStartUtc` to `endUtc`:
 
 ```
-logStartUtc ──┬─ ... reset (if enabled), health check, fix-up restarts ...
-              ├─ healthyUtc    every pod peered and the chain advancing
+logStartUtc ──┬─ ... reset (if enabled), health check, fix-ups ...
+              ├─ healthyUtc    every pod peered with all its static peers, chain advancing
               │   ... warmup (idle, warmupSeconds; only after a reset or fix-up) ...
               ├─ loadStartUtc  spamoor pod Ready
               │   ... load + top sampling ...
@@ -46,7 +49,8 @@ logStartUtc ──┬─ ... reset (if enabled), health check, fix-up restarts .
 | Spamoor private key | `$HOME\spamoor-privkey.txt` | Kept out of git; injected into the pod args at render time |
 | Image registry prefix | `$env:IMAGE_REGISTRY` | Kept out of git; prepended to the plan's `image` |
 | `kubectl`, `git` | on `PATH` | Cluster access and publishing results |
-| HTTP JSON-RPC on 8545 | every Besu pod | Health check (`net_peerCount`, `eth_blockNumber`) |
+| HTTP JSON-RPC on 8545 with the ADMIN API | every Besu pod | Health check (`admin_peers`, `admin_addPeer`, `eth_blockNumber`) |
+| `besu-peers` configmap | namespace | Static peers list; the health check reads it at startup |
 | Local ports 18545 upwards | VDS | One `kubectl port-forward` per Besu pod during the health check |
 
 Set the registry once (it persists for your user). The second line covers the current
@@ -80,12 +84,12 @@ All parameters have defaults.
 
 | Field | Default if absent | Meaning |
 |---|---|---|
-| `minPeers` | 3 | Minimum `net_peerCount` for every Besu pod. Includes the RPC node, so 3 on a validator is not proof of 3 validator peers |
 | `healthTimeoutSeconds` | 300 | How long one health wait lasts before a fix-up (or giving up) |
-| `maxFixups` | 2 | Single-pod restarts allowed per run before the run is abandoned |
+| `maxFixups` | 2 | Fix-ups (full reset or single-pod restart) allowed per run before the run is abandoned |
 
-Fixed in the script: the chain must advance 5 blocks, each pod must be within 2 blocks of
-the best head, polls every 10 s, RPC port 8545.
+Fixed in the script: every pod must be connected to every other running pod in the
+`besu-peers` configmap, the chain must advance 5 blocks, each pod must be within 2 blocks
+of the best head, polls every 10 s, RPC port 8545.
 
 ## Helpers
 
@@ -115,7 +119,8 @@ Most of these exist to work around Windows PowerShell 5.1:
     have no readiness probe, so this only means the containers have started, not that
     Besu is peered. The health check covers that.
 - **`Wait-NetworkHealthy`**: the health check. See [Health check](#health-check-and-fix-ups).
-- **`Confirm-NetworkHealthy`**: the health check plus fix-up restarts.
+- **`Confirm-NetworkHealthy`**: the health check plus fix-ups (full reset or single-pod
+  restart).
 - **`Publish-Run`** (only with `-Push`):
   - It stages and commits **only the zip it was given**, so unzipped folders under
     `runs\` or anything you've staged by hand stay out of the commit.
@@ -150,7 +155,7 @@ Most of these exist to work around Windows PowerShell 5.1:
 ## The run itself
 
 1. **Healthy network**: if resetting (plan's `resetNetwork` and no `-NoReset`), the
-   network is restarted. Then the health check runs, with fix-up restarts if needed. If
+   network is restarted. Then the health check runs, with fix-ups if needed. If
    the network still isn't healthy, the run is abandoned before any load is sent. The
    validator's restart count is read *after* this, so the before/after comparison only
    covers the load.
@@ -178,38 +183,50 @@ Most of these exist to work around Windows PowerShell 5.1:
 
 ## Health check and fix-ups
 
-A pod reporting Ready doesn't mean Besu is peered: after a full restart, one validator
-sometimes never connects to enough peers. So before any load, every run checks the
-network over RPC.
+A pod reporting Ready doesn't mean Besu is peered. On Besu 25.7.0, after a full restart,
+some static-peer links never form (seen: validator-4 never connected to validator-1 or
+validator-2, in either direction, even 15 minutes later). If that splits the validators,
+QBFT stalls until its round timers happen to line up, which took over 10 minutes. So
+before any load, every run checks the network over RPC.
 
-- The VDS can't reach pod IPs, so the script runs one `kubectl port-forward` per Besu
-  pod (local ports 18545, 18546, …) and calls `net_peerCount` and `eth_blockNumber` on
-  each. A forward that fails is restarted on the next poll, so a pod that was just
-  replaced is picked up.
-- A pod is **unhealthy** if it doesn't answer RPC, has fewer than `minPeers` peers, or is
-  more than 2 blocks behind the best head.
+- The VDS can't reach pod IPs, so the script keeps one `kubectl port-forward` per Besu
+  pod (local ports 18545, 18546, …) open across polls. kubectl takes about 5 s to start
+  listening, so each new forward gets up to 15 s. A forward is replaced if kubectl exits
+  or its pod is replaced (pod UID changes).
+- Each pod is asked for `admin_peers` and `eth_blockNumber`. Peers are matched to pods by
+  public key, using the `besu-peers` configmap's `static-nodes.json`.
+- A pod is **unhealthy** if it doesn't answer RPC, isn't connected to **every other
+  running pod in the static peers list**, or is more than 2 blocks behind the best head.
 - The network is **healthy** when no pod is unhealthy and the best head has advanced at
   least 5 blocks since the check began, which proves QBFT is producing blocks.
-- Every poll prints one progress line. Unhealthy pods are marked with `!`, and `p` is the
-  peer count:
+- After each poll, every pod that is missing static peers is asked to dial them with
+  `admin_addPeer`, from both ends of the link. This usually repairs the links within a
+  poll or two, without any restart.
+- Every poll prints one progress line. `p` is the peer count, unhealthy pods are marked
+  with `!`:
 
   ```
-    [00:40] rpc-1 4p #385437 | validator-1 3p #385437 | validator-2 1p #385430 ! | ... | +3/5 blocks
+    [00:40] rpc-1 4p #385437 | validator-1 3p #385437 missing validator-4 ! | ... | validator-4 2p #385437 missing validator-1,validator-2 ! | +3/5 blocks
   ```
 
-**Fix-ups.** If the network isn't healthy within `healthTimeoutSeconds`:
+**Fix-ups.** If the network still isn't healthy after `healthTimeoutSeconds`, the script
+escalates, up to `maxFixups` times per run:
 
-1. The worst unhealthy pod (no RPC first, then fewest peers) has its logs saved as
-   `fixup-<n>-<pod>.log`, and is deleted. Its statefulset recreates it.
-2. The health check starts again.
-3. Only **one pod at a time** is restarted, so QBFT never loses quorum.
-4. After `maxFixups` restarts, or if the chain has stalled with no single unhealthy pod to
-   blame, the run is abandoned. The logs of the unhealthy pods (or of every pod, for a
-   stall) are saved as `unhealthy-<pod>.log`, and `meta.error` says why. The next run
-   tries again from the start.
+- **Chain stalled** (fewer than 5 new blocks): a full network reset (`Reset-Network`),
+  after saving every pod's logs as `fixup-<n>-<pod>.log`. Restarting one validator
+  doesn't help here: it starts back at round 0, while the stalled validators sit in a
+  round whose timer has doubled each round (320 s at round 4, 640 s at round 5).
+- **Chain advancing, but a pod unhealthy**: that pod's logs are saved as
+  `fixup-<n>-<pod>.log` and the pod is deleted, so its statefulset recreates it. The worst
+  pod goes first (no RPC answer, then most missing peers). Only one pod is restarted at a
+  time, so QBFT never loses quorum.
 
-`meta.json` records `health`: `secondsToHealthy`, `fixupRestarts` (the pods restarted)
-and the final `peers` and `heads` per pod.
+After `maxFixups` fix-ups the run is abandoned before any load is sent. The logs of the
+unhealthy pods (every pod, for a stall) are saved as `unhealthy-<pod>.log`, and
+`meta.error` says why. The next run tries again from the start.
+
+`meta.json` records `health`: `secondsToHealthy`, `fixups` (`reset` or the pod restarted,
+in order) and the final `peers` (pod names) and `heads` per pod.
 
 ## Cleanup and packaging
 

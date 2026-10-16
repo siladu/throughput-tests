@@ -6,13 +6,17 @@ harness tool-agnostic where it's cheap to do so.
 
 ## How this repo is used (read first)
 
-There are two machines, and **git is the only data channel between them**:
+There are two machines. Git carries scripts **one way only**, host → VDS:
 
 | Machine | Who | Can reach the cluster? | Role |
 |---|---|---|---|
-| Host | You (Claude Code) + the user | **No** | Edit scripts and test plans, analyse results |
-| VDS (Windows, PowerShell) | The user only | Yes (kubectl) | `git pull`, run tests, push results |
+| Host | You (Claude Code) + the user | **No** | Edit scripts and test plans, commit and push, analyse results |
+| VDS (Windows, PowerShell) | The user only | Yes (kubectl) | `git pull`, run tests |
 
+- **The VDS can't push to GitHub.** Results, logs and command output come back only as
+  screenshots or pasted text, so run zips won't normally appear in `runs/` on the host.
+  When asking for data, ask for something that fits on a screen (counts, summaries,
+  `Select-String` filtered log lines), not whole files.
 - You cannot run kubectl, PowerShell scripts or tests yourself. Nothing in `scripts/` is
   meant to run on the host.
 - When the user needs to do something on the VDS, give **copy-pasteable PowerShell** in a
@@ -40,18 +44,20 @@ runs/
 
 Invocation: `.\scripts\Run-SpamoorTests.ps1 [<group>] [-NoReset] [-Push]`. `<group>` is
 an optional subfolder of `runs/`. `-NoReset` overrides the plan's `resetNetwork`.
-Pushing is **off by default**: without `-Push` the zips land in `runs/` uncommitted, and
-the user commits and pushes them.
+Pushing is **off by default**: without `-Push` the zips land in `runs/` uncommitted.
+`-Push` won't work from the VDS while it can't push.
 
 Per run in `test-plan.json`:
 
 1. Optionally reset the network (`resetNetwork`, unless `-NoReset`): scale every
    statefulset to 0, wait until all Besu pods are gone, scale back to 1. Not
    `rollout restart`, which lets new nodes peer with old ones and inherit their txpools.
-2. Health check: port-forward to every Besu pod and poll `net_peerCount` /
-   `eth_blockNumber` until each has `minPeers` peers, none lags, and the chain has
-   advanced. If it doesn't get there, restart the worst pod (one at a time, at most
-   `maxFixups`), then abandon the run if still unhealthy.
+2. Health check: port-forward to every Besu pod and poll `admin_peers` /
+   `eth_blockNumber` until each is connected to all its static peers (`besu-peers`
+   configmap), none lags, and the chain has advanced. Missing links are re-dialled with
+   `admin_addPeer` every poll. If still unhealthy after `healthTimeoutSeconds`: a stalled
+   chain gets a full reset, otherwise the worst pod is restarted (one at a time). After
+   `maxFixups` of those, the run is abandoned.
 3. Stream the validator's logs with `kubectl logs -f --since-time=<logStartUtc>`, which
    backfills the reset and health check. Streaming is used instead of a one-off
    `kubectl logs` because kubelet log rotation would drop lines. Then wait
@@ -72,7 +78,7 @@ Errors in one run are recorded in `meta.json` and the loop moves on.
 
 Top level: `image` (`name:tag` only, no registry), `namespace`, `validatorPod`, `rpcUrl`,
 `scenario` (spamoor subcommand), `slotDuration`, `resetNetwork`, `warmupSeconds`,
-`minPeers`, `healthTimeoutSeconds`, `maxFixups`, `cooldownSeconds`, `sampleSeconds`, `runs`.
+`healthTimeoutSeconds`, `maxFixups`, `cooldownSeconds`, `sampleSeconds`, `runs`.
 
 Each run: `name` (becomes part of the run ID and pod name, keep it short, lowercase,
 `[a-z0-9-]`), `durationMinutes` (expected 5-15), `throughput` (spamoor `-t`), `amount`
@@ -90,11 +96,11 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
 - `top.log`: `<UTC timestamp> <pod> <container> <cpu> <memory>` samples for every pod.
 - `meta.json`: parameters (incl. `group`, `resetNetwork`, `warmupSeconds`), UTC timestamps
   (`logStartUtc`, `healthyUtc`, `loadStartUtc`, `loadEndUtc`, `endUtc`), `health`
-  (`secondsToHealthy`, `fixupRestarts`, final `peers`/`heads` per pod), nodes used,
+  (`secondsToHealthy`, `fixups`, final `peers`/`heads` per pod), nodes used,
   validator restart counts before/after, `logStreamDiedEarly`, `spamoorPhase`, `error`
   if any.
-- `fixup-<n>-<pod>.log`: logs of a pod the health check restarted, taken just before the
-  restart. Evidence for the startup peering race; worth reading when present.
+- `fixup-<n>-<pod>.log`: logs taken just before a fix-up (the restarted pod, or every pod
+  for a full reset). Evidence for the startup peering problem (see Cluster context).
 - `unhealthy-<pod>.log`: present when the run was abandoned because the network never
   became healthy (no load was sent).
 - `validator-fallback.log` / `validator-previous.log`: only present if the validator
@@ -134,6 +140,17 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
   tolerate the taint, require `kubernetes.azure.com/agentpool In (besu)` (otherwise it
   lands in the separate `besu2` pool), and use the same anti-affinity so it gets the
   free node.
+- Besu 25.7.0 for now (an upgrade to the latest release is planned). Every pod has HTTP
+  JSON-RPC on 8545 with the ADMIN API, and no readiness probe (Ready = container started).
+  Peering comes from configmaps `besu-peers` (`static-nodes.json`: all 4 validators +
+  rpc-1, by headless-service DNS name) and `besu-bootnodes` (validator-1, validator-2).
+  The chart already sets `--Xdns-enabled=true --Xdns-update-enabled=true`.
+- Known issue, parked until the Besu upgrade: after a full restart some static-peer
+  links never form (on 2026-10-16, validator-4 never peered with validator-1/2 in either
+  direction). If that splits the validators, QBFT stalls until the doubling round timers
+  line up (10+ minutes). The runner works around it with `admin_addPeer`; re-check after
+  upgrading before assuming it's still needed.
+- From the VDS, `kubectl port-forward` takes about 5 s to start listening.
 - RPC endpoint inside the cluster:
   `http://besu-node-rpc-1-0.besu-node-rpc-1.besu-consensus.svc.cluster.local:8545`.
 

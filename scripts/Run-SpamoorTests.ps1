@@ -131,46 +131,92 @@ function Get-PlanInt([string]$Name, [int]$Default) {
 # besu-node-validator-1-0 -> validator-1, for progress lines
 function Get-ShortName([string]$Pod) { ($Pod -replace '^besu-node-', '') -replace '-0$', '' }
 
-function Invoke-Rpc([int]$Port, [string]$Method) {
-    $body = '{"jsonrpc":"2.0","method":"' + $Method + '","params":[],"id":1}'
+# JSON-RPC call through a local port-forward, with at most one string param. Returns
+# 'result'; throws on any failure, including a JSON-RPC error.
+function Invoke-Rpc([int]$Port, [string]$Method, [string]$Param) {
+    $params = ''
+    if ($Param) { $params = '"' + $Param + '"' }
+    $body = '{"jsonrpc":"2.0","method":"' + $Method + '","params":[' + $params + '],"id":1}'
     $r = Invoke-RestMethod -Uri "http://127.0.0.1:$Port" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 5
-    return [Convert]::ToInt64(([string]$r.result).Substring(2), 16)
+    if ($r.error) { throw "$Method failed: $($r.error.message)" }
+    return $r.result
+}
+
+function ConvertFrom-Hex([string]$Hex) { [Convert]::ToInt64($Hex.Substring(2), 16) }
+
+function Test-LocalPort([int]$Port) {
+    $c = New-Object Net.Sockets.TcpClient
+    try { return $c.ConnectAsync('127.0.0.1', $Port).Wait(500) } catch { return $false } finally { $c.Close() }
+}
+
+# UID of each Besu pod that currently exists, so a forward to a replaced pod is noticed
+function Get-PodUids {
+    $uids  = @{}
+    $lines = Invoke-Native $kubectl (@('get', 'pods', '-n', $ns, '--ignore-not-found', '--no-headers',
+            '-o', 'custom-columns=NAME:.metadata.name,UID:.metadata.uid') + $besuPods) -AllowFailure
+    foreach ($l in $lines) {
+        $f = "$l".Trim() -split '\s+'
+        if ($f.Count -eq 2) { $uids[$f[0]] = $f[1] }
+    }
+    return $uids
 }
 
 function Save-PodLog([string]$Pod, [string]$Since, [string]$Path) {
     Save-NativeOutput $kubectl @('logs', '-n', $ns, $Pod, "--since-time=$Since") $Path
 }
 
-# Polls every Besu pod's RPC (through kubectl port-forward) until each has at least
-# $minPeers peers and is within $maxBlocksBehind of the best head, and the best head has
-# advanced $minNewBlocks since polling began. Prints one progress line per poll. Gives up
-# after $healthTimeoutSeconds. Returns Healthy, Bad (pods failing their own checks),
-# Peers and Heads.
+# Polls every Besu pod's RPC (through kubectl port-forward) until each is connected to all
+# of its static peers and within $maxBlocksBehind of the best head, and the best head has
+# advanced $minNewBlocks since polling began. A pod missing static peers is asked to dial
+# them (admin_addPeer) on every poll. Prints one progress line per poll and gives up after
+# $healthTimeoutSeconds. Returns Healthy, Stalled (chain not advancing), Bad (pods failing
+# their own checks), Missing, Peers and Heads.
 function Wait-NetworkHealthy {
-    $forwards  = @{}
+    $forwards  = @{}   # pod -> @{ Proc; Uid; Port }
     $startHead = $null
     $t0        = Get-Date
     try {
         while ($true) {
-            $peers = @{}
-            $heads = @{}
+            # Keep one forward per pod across polls; replace it if kubectl exited or the
+            # pod was replaced
+            $uids    = Get-PodUids
+            $started = @()
             for ($i = 0; $i -lt $besuPods.Count; $i++) {
-                $pod  = $besuPods[$i]
-                $port = $rpcLocalPortBase + $i
-                # (Re)start the forward if it isn't running, e.g. after its pod restarted
-                if (-not $forwards[$pod] -or $forwards[$pod].HasExited) {
-                    $forwards[$pod] = Start-Process -FilePath $kubectl -WindowStyle Hidden -PassThru `
-                        -ArgumentList @('port-forward', '-n', $ns, "pod/$pod", "${port}:$rpcPort")
-                    Start-Sleep -Seconds 2
-                }
-                try {
-                    $peers[$pod] = Invoke-Rpc $port 'net_peerCount'
-                    $heads[$pod] = Invoke-Rpc $port 'eth_blockNumber'
-                } catch {
-                    # Some kubectl versions keep a forward open after its pod is replaced;
-                    # drop it so the next poll reconnects to the current pod
-                    if (-not $forwards[$pod].HasExited) { Stop-Process -Id $forwards[$pod].Id -Force }
+                $pod = $besuPods[$i]
+                $f   = $forwards[$pod]
+                if ($f -and ($f.Proc.HasExited -or $f.Uid -ne $uids[$pod])) {
+                    if (-not $f.Proc.HasExited) { Stop-Process -Id $f.Proc.Id -Force }
                     $forwards.Remove($pod)
+                    $f = $null
+                }
+                if (-not $f -and $uids.ContainsKey($pod)) {
+                    $port = $rpcLocalPortBase + $i
+                    $proc = Start-Process -FilePath $kubectl -WindowStyle Hidden -PassThru `
+                        -ArgumentList @('port-forward', '-n', $ns, "pod/$pod", "${port}:$rpcPort")
+                    $forwards[$pod] = @{ Proc = $proc; Uid = $uids[$pod]; Port = $port }
+                    $started += $port
+                }
+            }
+            # kubectl takes ~5 s to start listening on the VDS
+            $readyBy = (Get-Date).AddSeconds(15)
+            while ($started.Count -gt 0 -and (Get-Date) -lt $readyBy) {
+                $started = @($started | Where-Object { -not (Test-LocalPort $_) })
+                if ($started.Count -gt 0) { Start-Sleep -Milliseconds 500 }
+            }
+
+            $peers = @{}   # pod -> pods it's connected to
+            $heads = @{}
+            foreach ($pod in $besuPods) {
+                if (-not $forwards[$pod]) { continue }
+                $port = $forwards[$pod].Port
+                try {
+                    $peers[$pod] = @(Invoke-Rpc $port 'admin_peers' | ForEach-Object {
+                        if ($_.enode -match '^enode://([0-9a-fA-F]+)@') { $podByKey[$Matches[1].ToLower()] }
+                    } | Where-Object { $_ })
+                    $heads[$pod] = ConvertFrom-Hex (Invoke-Rpc $port 'eth_blockNumber')
+                } catch {
+                    $peers.Remove($pod)
+                    $heads.Remove($pod)
                 }
             }
 
@@ -178,13 +224,24 @@ function Wait-NetworkHealthy {
             if ($null -ne $best -and $null -eq $startHead) { $startHead = $best }
             $newBlocks = 0
             if ($null -ne $startHead) { $newBlocks = $best - $startHead }
-            $bad = @($besuPods | Where-Object {
-                -not $heads.ContainsKey($_) -or $peers[$_] -lt $minPeers -or $heads[$_] -lt ($best - $maxBlocksBehind)
-            })
+
+            $missing = @{}   # pod -> static peers it isn't connected to
+            $bad     = @()
+            foreach ($pod in $besuPods) {
+                if (-not $heads.ContainsKey($pod)) { $bad += $pod; continue }
+                $connected     = $peers[$pod]
+                $missing[$pod] = @($expectedPeers[$pod] | Where-Object { $connected -notcontains $_ })
+                if ($missing[$pod].Count -gt 0 -or $heads[$pod] -lt ($best - $maxBlocksBehind)) { $bad += $pod }
+            }
 
             $parts = foreach ($pod in $besuPods) {
                 $s = Get-ShortName $pod
-                if ($heads.ContainsKey($pod)) { $s += " $($peers[$pod])p #$($heads[$pod])" } else { $s += ' no-rpc' }
+                if ($heads.ContainsKey($pod)) {
+                    $s += " $($peers[$pod].Count)p #$($heads[$pod])"
+                    if ($missing[$pod].Count -gt 0) { $s += ' missing ' + (($missing[$pod] | ForEach-Object { Get-ShortName $_ }) -join ',') }
+                } else {
+                    $s += ' no-rpc'
+                }
                 if ($bad -contains $pod) { $s += ' !' }
                 $s
             }
@@ -193,46 +250,68 @@ function Wait-NetworkHealthy {
 
             $healthy = ($bad.Count -eq 0 -and $newBlocks -ge $minNewBlocks)
             if ($healthy -or $elapsed.TotalSeconds -ge $healthTimeoutSeconds) {
-                return @{ Healthy = $healthy; Bad = $bad; Peers = $peers; Heads = $heads }
+                return @{
+                    Healthy = $healthy; Stalled = ($newBlocks -lt $minNewBlocks); Bad = $bad
+                    Missing = $missing; Peers = $peers; Heads = $heads
+                }
+            }
+
+            # Ask each pod to dial the static peers it's missing. Both ends of a missing
+            # link get asked; Besu keeps a single connection per peer.
+            foreach ($pod in @($missing.Keys)) {
+                foreach ($other in $missing[$pod]) {
+                    try { Invoke-Rpc $forwards[$pod].Port 'admin_addPeer' $staticEnode[$other] | Out-Null } catch { }
+                }
             }
             Start-Sleep -Seconds $healthPollSeconds
         }
     } finally {
-        foreach ($f in $forwards.Values) { if (-not $f.HasExited) { Stop-Process -Id $f.Id -Force } }
+        foreach ($f in $forwards.Values) { if (-not $f.Proc.HasExited) { Stop-Process -Id $f.Proc.Id -Force } }
     }
 }
 
-# Waits for a healthy network, restarting one unhealthy pod at a time (never two at once,
-# so QBFT keeps quorum), up to $maxFixups times. Saves the logs of every pod it restarts
-# or gives up on into $RunDir. Throws if the network is still unhealthy.
+# Waits for a healthy network, escalating up to $maxFixups times if it isn't healthy in
+# time. A stalled chain gets a full network reset: QBFT round timers double each round, so
+# stalled validators can sit in one round for many minutes, and a single restarted
+# validator starts back at round 0, out of step with the rest. A chain that's advancing
+# with one unhealthy pod gets just that pod restarted (never two at once, so QBFT keeps
+# quorum). Saves the logs of the pods involved into $RunDir. Throws if still unhealthy.
 function Confirm-NetworkHealthy([string]$RunDir, [string]$Since) {
     $t0     = Get-Date
     $fixups = @()
     while ($true) {
-        Write-Host "  Waiting for network health (every pod >= $minPeers peers, chain +$minNewBlocks blocks; timeout $healthTimeoutSeconds s) ..."
+        Write-Host "  Waiting for network health (every pod peered with all its static peers, chain +$minNewBlocks blocks; timeout $healthTimeoutSeconds s) ..."
         $h = Wait-NetworkHealthy
         if ($h.Healthy) { break }
 
-        if ($h.Bad.Count -eq 0 -or $fixups.Count -ge $maxFixups) {
+        $n = $fixups.Count + 1
+        if ($h.Stalled) { $why = 'chain not advancing' } else { $why = "unhealthy: $($h.Bad -join ', ')" }
+        if ($fixups.Count -ge $maxFixups) {
             $suspects = @($h.Bad)
-            if ($suspects.Count -eq 0) { $suspects = $besuPods }   # chain stalled with no obvious culprit
+            if ($h.Stalled -or $suspects.Count -eq 0) { $suspects = $besuPods }
             foreach ($pod in $suspects) { Save-PodLog $pod $Since (Join-Path $RunDir "unhealthy-$pod.log") }
-            if ($h.Bad.Count -eq 0) { $why = 'chain not advancing' } else { $why = "unhealthy: $($h.Bad -join ', ')" }
-            throw "Network not healthy after $($fixups.Count) fix-up restart(s); $why"
+            throw "Network not healthy after $($fixups.Count) fix-up(s) ($($fixups -join ', ')); $why"
         }
 
-        # Restart the worst-connected pod; pods with no RPC answer sort first
-        $pod = $h.Bad | Sort-Object { $h.Peers[$_] } | Select-Object -First 1
-        $n   = $fixups.Count + 1
-        Write-Warning "$pod is unhealthy; restarting it (fix-up $n of $maxFixups)"
-        Save-PodLog $pod $Since (Join-Path $RunDir "fixup-$n-$pod.log")
-        Invoke-Native $kubectl @('delete', 'pod', $pod, '-n', $ns, '--wait=true') | Out-Null
-        $fixups += $pod
+        if ($h.Stalled) {
+            Write-Warning "Chain not advancing; resetting the whole network (fix-up $n of $maxFixups)"
+            foreach ($pod in $besuPods) { Save-PodLog $pod $Since (Join-Path $RunDir "fixup-$n-$pod.log") }
+            Reset-Network
+            $fixups += 'reset'
+        } else {
+            # No RPC answer first, then the most missing peers
+            $pod = $h.Bad | Sort-Object { if ($h.Missing.ContainsKey($_)) { -$h.Missing[$_].Count } else { -999 } } |
+                Select-Object -First 1
+            Write-Warning "$pod is unhealthy ($why); restarting it (fix-up $n of $maxFixups)"
+            Save-PodLog $pod $Since (Join-Path $RunDir "fixup-$n-$pod.log")
+            Invoke-Native $kubectl @('delete', 'pod', $pod, '-n', $ns, '--wait=true') | Out-Null
+            $fixups += $pod
+        }
     }
     Write-Host "  Network healthy after $([int]((Get-Date) - $t0).TotalSeconds) s."
     return [ordered]@{
         secondsToHealthy = [int]((Get-Date) - $t0).TotalSeconds
-        fixupRestarts    = $fixups
+        fixups           = $fixups
         peers            = $h.Peers
         heads            = $h.Heads
     }
@@ -290,7 +369,6 @@ $image = '{0}/{1}' -f $Registry.TrimEnd('/'), $plan.image
 $doReset = [bool]$plan.resetNetwork -and -not $NoReset
 
 # Health check before each run's load: see Wait-NetworkHealthy
-$minPeers             = Get-PlanInt 'minPeers' 3
 $healthTimeoutSeconds = Get-PlanInt 'healthTimeoutSeconds' 300
 $maxFixups            = Get-PlanInt 'maxFixups' 2
 $minNewBlocks         = 5
@@ -298,10 +376,29 @@ $maxBlocksBehind      = 2
 $healthPollSeconds    = 10
 $rpcPort              = 8545
 $rpcLocalPortBase     = 18545
+$peersConfigMap       = 'besu-peers'
 
 $besuPods = @((Invoke-Native $kubectl @('get', 'pods', '-n', $ns, '-l', 'app.kubernetes.io/component=besu',
             '-o', 'jsonpath={.items[*].metadata.name}')) -join ' ' -split '\s+' | Where-Object { $_ } | Sort-Object)
 if ($besuPods.Count -eq 0) { throw "No Besu pods (app.kubernetes.io/component=besu) found in $ns." }
+
+# Static peers, from the configmap every Besu pod mounts. The pod name is the first label
+# of each enode's host; the public key maps admin_peers results back to pods.
+$staticJson = (Invoke-Native $kubectl @('get', 'configmap', $peersConfigMap, '-n', $ns,
+            '-o', 'jsonpath={.data.static-nodes\.json}')) -join "`n"
+$staticEnode = @{}   # pod -> enode URL
+$podByKey    = @{}   # lowercase public key -> pod
+foreach ($e in ($staticJson | ConvertFrom-Json)) {
+    if ($e -match '^enode://([0-9a-fA-F]+)@([^.:]+)') {
+        $staticEnode[$Matches[2]] = $e
+        $podByKey[$Matches[1].ToLower()] = $Matches[2]
+    }
+}
+if ($staticEnode.Count -eq 0) { throw "No enodes found in configmap $peersConfigMap." }
+$expectedPeers = @{}   # pod -> the other running pods it should be connected to
+foreach ($p in $besuPods) {
+    $expectedPeers[$p] = @($besuPods | Where-Object { $_ -ne $p -and $staticEnode.ContainsKey($_) })
+}
 
 $runsDir = Join-Path $RepoRoot 'runs'
 $workDir = $WorkRoot
@@ -386,7 +483,7 @@ foreach ($run in $runs) {
 
         # Let a restarted network or pod settle before load
         $meta.warmupSeconds = 0
-        if ($doReset -or $meta.health.fixupRestarts.Count -gt 0) {
+        if ($doReset -or $meta.health.fixups.Count -gt 0) {
             $meta.warmupSeconds = $warmupSeconds
             Write-Host "  Warming up for $warmupSeconds s ..."
             Start-Sleep -Seconds $warmupSeconds
