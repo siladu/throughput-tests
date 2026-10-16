@@ -2,17 +2,28 @@
 .SYNOPSIS
     Runs the spamoor load tests listed in test-plan.json. For each run it streams one
     validator's logs, samples pod CPU/memory, runs spamoor for the set duration, lets the
-    txpool drain, then zips everything and pushes it to the repo's runs/ folder.
+    txpool drain, then zips everything into the repo's runs/ folder (and, with -Push,
+    commits and pushes it).
 
 .EXAMPLE
     git pull
-    .\scripts\Run-SpamoorTests.ps1
+    .\scripts\Run-SpamoorTests.ps1                   # results go to runs\, not pushed
 
 .EXAMPLE
-    .\scripts\Run-SpamoorTests.ps1 -NoPush      # keep results local only
+    .\scripts\Run-SpamoorTests.ps1 txpool-config     # results go to runs\txpool-config\
+
+.EXAMPLE
+    .\scripts\Run-SpamoorTests.ps1 -NoReset          # don't restart the network, whatever the plan says
+
+.EXAMPLE
+    .\scripts\Run-SpamoorTests.ps1 -Push             # commit and push each result as it finishes
 #>
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
+    # Optional subfolder of runs\ (and of -WorkRoot) to group this batch's results under
+    [Parameter(Position = 0)]
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]*$')]
+    [string]$Group,
     [string]$PlanFile     = (Join-Path $PSScriptRoot 'test-plan.json'),
     [string]$TemplateFile = (Join-Path $PSScriptRoot 'spamoor-run.template.yml'),
     [string]$RepoRoot     = (Split-Path $PSScriptRoot -Parent),
@@ -20,7 +31,8 @@ param(
     [string]$PrivKeyFile  = (Join-Path $HOME 'spamoor-privkey.txt'),   # kept outside the repo on purpose
     [string]$Registry     = $env:IMAGE_REGISTRY,                       # registry + path prefix, kept outside the repo
     [int]$MaxZipMB        = 95,                                        # GitHub rejects files over 100 MB
-    [switch]$NoPush
+    [switch]$NoReset,                                                  # overrides the plan's resetNetwork
+    [switch]$Push                                                      # commit and push each run's zip
 )
 
 $ErrorActionPreference = 'Stop'
@@ -81,22 +93,161 @@ function Get-PodField([string]$Pod, [string]$JsonPath) {
 
 function Get-UtcStamp { (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss'Z'") }
 
+# Full network restart: scale every statefulset to 0 and wait until every Besu pod is
+# gone before bringing any back. Unlike 'rollout restart', no new node can peer with an
+# old one (and be handed its pending transactions). Each statefulset is scaled back to 1,
+# one pod per Helm release, even if a previous aborted reset left it at 0.
 function Reset-Network {
-    Write-Host "  Restarting all statefulsets in $ns ..."
-    Invoke-Native $kubectl @('rollout', 'restart', 'statefulset', '-n', $ns) | Out-Null
-    foreach ($s in (Invoke-Native $kubectl @('get', 'statefulset', '-n', $ns, '-o', 'name'))) {
+    $sets = @(Invoke-Native $kubectl @('get', 'statefulset', '-n', $ns, '-o', 'name') | Where-Object { $_ })
+    Write-Host "  Scaling $($sets.Count) statefulsets in $ns to 0 ..."
+    try {
+        foreach ($s in $sets) { Invoke-Native $kubectl @('scale', $s, '-n', $ns, '--replicas=0') | Out-Null }
+        $deadline = (Get-Date).AddMinutes(10)
+        while ($true) {
+            $left = @(Invoke-Native $kubectl (@('get', 'pods', '-n', $ns, '--ignore-not-found', '-o', 'name') + $besuPods) |
+                Where-Object { $_ } | ForEach-Object { $_ -replace '^pod/', '' })
+            if ($left.Count -eq 0) { break }
+            if ((Get-Date) -gt $deadline) { throw "Besu pods still running 10 min after scaling to 0: $($left -join ', ')" }
+            Write-Host "    waiting for $($left.Count) pod(s) to stop: $($left -join ', ')"
+            Start-Sleep -Seconds 5
+        }
+        Write-Host '  All Besu pods stopped; scaling back to 1 ...'
+    } finally {
+        # Always bring the network back, even if the scale-down failed part way
+        foreach ($s in $sets) { Invoke-Native $kubectl @('scale', $s, '-n', $ns, '--replicas=1') -AllowFailure | Out-Null }
+    }
+    foreach ($s in $sets) {
         Invoke-Native $kubectl @('rollout', 'status', $s, '-n', $ns, '--timeout=15m') | Out-Null
     }
-    Write-Host '  Network back up.'
+    Write-Host '  All pods started.'
 }
 
-function Publish-Runs([string]$Message) {
+function Get-PlanInt([string]$Name, [int]$Default) {
+    $v = $plan.$Name
+    if ($null -eq $v) { return $Default }
+    return [int]$v
+}
+
+# besu-node-validator-1-0 -> validator-1, for progress lines
+function Get-ShortName([string]$Pod) { ($Pod -replace '^besu-node-', '') -replace '-0$', '' }
+
+function Invoke-Rpc([int]$Port, [string]$Method) {
+    $body = '{"jsonrpc":"2.0","method":"' + $Method + '","params":[],"id":1}'
+    $r = Invoke-RestMethod -Uri "http://127.0.0.1:$Port" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 5
+    return [Convert]::ToInt64(([string]$r.result).Substring(2), 16)
+}
+
+function Save-PodLog([string]$Pod, [string]$Since, [string]$Path) {
+    Save-NativeOutput $kubectl @('logs', '-n', $ns, $Pod, "--since-time=$Since") $Path
+}
+
+# Polls every Besu pod's RPC (through kubectl port-forward) until each has at least
+# $minPeers peers and is within $maxBlocksBehind of the best head, and the best head has
+# advanced $minNewBlocks since polling began. Prints one progress line per poll. Gives up
+# after $healthTimeoutSeconds. Returns Healthy, Bad (pods failing their own checks),
+# Peers and Heads.
+function Wait-NetworkHealthy {
+    $forwards  = @{}
+    $startHead = $null
+    $t0        = Get-Date
+    try {
+        while ($true) {
+            $peers = @{}
+            $heads = @{}
+            for ($i = 0; $i -lt $besuPods.Count; $i++) {
+                $pod  = $besuPods[$i]
+                $port = $rpcLocalPortBase + $i
+                # (Re)start the forward if it isn't running, e.g. after its pod restarted
+                if (-not $forwards[$pod] -or $forwards[$pod].HasExited) {
+                    $forwards[$pod] = Start-Process -FilePath $kubectl -WindowStyle Hidden -PassThru `
+                        -ArgumentList @('port-forward', '-n', $ns, "pod/$pod", "${port}:$rpcPort")
+                    Start-Sleep -Seconds 2
+                }
+                try {
+                    $peers[$pod] = Invoke-Rpc $port 'net_peerCount'
+                    $heads[$pod] = Invoke-Rpc $port 'eth_blockNumber'
+                } catch {
+                    # Some kubectl versions keep a forward open after its pod is replaced;
+                    # drop it so the next poll reconnects to the current pod
+                    if (-not $forwards[$pod].HasExited) { Stop-Process -Id $forwards[$pod].Id -Force }
+                    $forwards.Remove($pod)
+                }
+            }
+
+            $best = ($heads.Values | Measure-Object -Maximum).Maximum
+            if ($null -ne $best -and $null -eq $startHead) { $startHead = $best }
+            $newBlocks = 0
+            if ($null -ne $startHead) { $newBlocks = $best - $startHead }
+            $bad = @($besuPods | Where-Object {
+                -not $heads.ContainsKey($_) -or $peers[$_] -lt $minPeers -or $heads[$_] -lt ($best - $maxBlocksBehind)
+            })
+
+            $parts = foreach ($pod in $besuPods) {
+                $s = Get-ShortName $pod
+                if ($heads.ContainsKey($pod)) { $s += " $($peers[$pod])p #$($heads[$pod])" } else { $s += ' no-rpc' }
+                if ($bad -contains $pod) { $s += ' !' }
+                $s
+            }
+            $elapsed = (Get-Date) - $t0
+            Write-Host ('  [{0:mm\:ss}] {1} | +{2}/{3} blocks' -f $elapsed, ($parts -join ' | '), $newBlocks, $minNewBlocks)
+
+            $healthy = ($bad.Count -eq 0 -and $newBlocks -ge $minNewBlocks)
+            if ($healthy -or $elapsed.TotalSeconds -ge $healthTimeoutSeconds) {
+                return @{ Healthy = $healthy; Bad = $bad; Peers = $peers; Heads = $heads }
+            }
+            Start-Sleep -Seconds $healthPollSeconds
+        }
+    } finally {
+        foreach ($f in $forwards.Values) { if (-not $f.HasExited) { Stop-Process -Id $f.Id -Force } }
+    }
+}
+
+# Waits for a healthy network, restarting one unhealthy pod at a time (never two at once,
+# so QBFT keeps quorum), up to $maxFixups times. Saves the logs of every pod it restarts
+# or gives up on into $RunDir. Throws if the network is still unhealthy.
+function Confirm-NetworkHealthy([string]$RunDir, [string]$Since) {
+    $t0     = Get-Date
+    $fixups = @()
+    while ($true) {
+        Write-Host "  Waiting for network health (every pod >= $minPeers peers, chain +$minNewBlocks blocks; timeout $healthTimeoutSeconds s) ..."
+        $h = Wait-NetworkHealthy
+        if ($h.Healthy) { break }
+
+        if ($h.Bad.Count -eq 0 -or $fixups.Count -ge $maxFixups) {
+            $suspects = @($h.Bad)
+            if ($suspects.Count -eq 0) { $suspects = $besuPods }   # chain stalled with no obvious culprit
+            foreach ($pod in $suspects) { Save-PodLog $pod $Since (Join-Path $RunDir "unhealthy-$pod.log") }
+            if ($h.Bad.Count -eq 0) { $why = 'chain not advancing' } else { $why = "unhealthy: $($h.Bad -join ', ')" }
+            throw "Network not healthy after $($fixups.Count) fix-up restart(s); $why"
+        }
+
+        # Restart the worst-connected pod; pods with no RPC answer sort first
+        $pod = $h.Bad | Sort-Object { $h.Peers[$_] } | Select-Object -First 1
+        $n   = $fixups.Count + 1
+        Write-Warning "$pod is unhealthy; restarting it (fix-up $n of $maxFixups)"
+        Save-PodLog $pod $Since (Join-Path $RunDir "fixup-$n-$pod.log")
+        Invoke-Native $kubectl @('delete', 'pod', $pod, '-n', $ns, '--wait=true') | Out-Null
+        $fixups += $pod
+    }
+    Write-Host "  Network healthy after $([int]((Get-Date) - $t0).TotalSeconds) s."
+    return [ordered]@{
+        secondsToHealthy = [int]((Get-Date) - $t0).TotalSeconds
+        fixupRestarts    = $fixups
+        peers            = $h.Peers
+        heads            = $h.Heads
+    }
+}
+
+# Commits just the given zip (not anything else under runs\, such as unzipped copies)
+# and pushes, along with any earlier commits whose push failed
+function Publish-Run([string]$ZipPath, [string]$Message) {
     Push-Location $RepoRoot
     try {
-        Invoke-Native $git @('add', '--', 'runs') | Out-Null
-        Invoke-Native $git @('diff', '--cached', '--quiet') -AllowFailure | Out-Null
+        Invoke-Native $git @('add', '--', $ZipPath) | Out-Null
+        Invoke-Native $git @('diff', '--cached', '--quiet', '--', $ZipPath) -AllowFailure | Out-Null
         if ($script:LastExit -ne 0) {
-            Invoke-Native $git @('commit', '-m', $Message) | Out-Null
+            # Pathspec so anything else you've staged by hand stays out of this commit
+            Invoke-Native $git @('commit', '-m', $Message, '--', $ZipPath) | Out-Null
         }
         for ($attempt = 1; $attempt -le 3; $attempt++) {
             Invoke-Native $git @('pull', '--rebase', '--autostash') -AllowFailure | Out-Null
@@ -136,11 +287,34 @@ if (-not $Registry) {
 }
 $image = '{0}/{1}' -f $Registry.TrimEnd('/'), $plan.image
 
+$doReset = [bool]$plan.resetNetwork -and -not $NoReset
+
+# Health check before each run's load: see Wait-NetworkHealthy
+$minPeers             = Get-PlanInt 'minPeers' 3
+$healthTimeoutSeconds = Get-PlanInt 'healthTimeoutSeconds' 300
+$maxFixups            = Get-PlanInt 'maxFixups' 2
+$minNewBlocks         = 5
+$maxBlocksBehind      = 2
+$healthPollSeconds    = 10
+$rpcPort              = 8545
+$rpcLocalPortBase     = 18545
+
+$besuPods = @((Invoke-Native $kubectl @('get', 'pods', '-n', $ns, '-l', 'app.kubernetes.io/component=besu',
+            '-o', 'jsonpath={.items[*].metadata.name}')) -join ' ' -split '\s+' | Where-Object { $_ } | Sort-Object)
+if ($besuPods.Count -eq 0) { throw "No Besu pods (app.kubernetes.io/component=besu) found in $ns." }
+
 $runsDir = Join-Path $RepoRoot 'runs'
-New-Item -ItemType Directory -Force -Path $runsDir, $WorkRoot | Out-Null
+$workDir = $WorkRoot
+if ($Group) {
+    $runsDir = Join-Path $runsDir $Group
+    $workDir = Join-Path $WorkRoot $Group
+}
+New-Item -ItemType Directory -Force -Path $runsDir, $workDir | Out-Null
 
 $loadMinutes = ($runs | Measure-Object -Property durationMinutes -Sum).Sum
-Write-Host "$($runs.Count) runs, $loadMinutes min of load plus warmup/cooldown per run."
+Write-Host "$($runs.Count) runs, $loadMinutes min of load plus setup/cooldown per run."
+Write-Host "Network reset before each run: $doReset. Results go to $runsDir."
+Write-Host "Health check covers: $($besuPods -join ', ')"
 
 # Remove leftover spamoor pods, including the original hand-made 'spamoor' pod
 Invoke-Native $kubectl @('delete', 'pod', '-n', $ns, '-l', 'app=spamoor', '--ignore-not-found', '--wait=true') | Out-Null
@@ -158,7 +332,7 @@ foreach ($run in $runs) {
     $podName  = "spamoor-$runId"
     if ($podName.Length -gt 63) { $podName = $podName.Substring(0, 63) }
     $podName  = $podName.TrimEnd('-')
-    $runDir   = Join-Path $WorkRoot $runId
+    $runDir   = Join-Path $workDir $runId
     New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 
     Write-Host "`n=== Run $runNumber/$($runs.Count): $runId ($($run.durationMinutes) min) ==="
@@ -174,14 +348,14 @@ foreach ($run in $runs) {
 
     $meta = [ordered]@{
         runId           = $runId
+        group           = $Group
         name            = $run.name
         image           = $plan.image                                  # without the registry
         durationMinutes = $run.durationMinutes
         throughput      = $run.throughput
         amount          = $run.amount
         spamoorArgs     = @($spamoorArgs | ForEach-Object { if ($_ -eq $privKey) { '<redacted>' } else { $_ } })
-        resetNetwork    = [bool]$plan.resetNetwork
-        warmupSeconds   = $(if ($plan.resetNetwork) { $warmupSeconds } else { 0 })
+        resetNetwork    = $doReset
         validatorPod    = $validatorPod
     }
 
@@ -190,29 +364,35 @@ foreach ($run in $runs) {
     $spamoorAlive = $false
 
     try {
-        if ($plan.resetNetwork) { Reset-Network }
+        # validator.log covers everything from here: reset, health check, warmup, load, cooldown
+        $meta.logStartUtc = Get-UtcStamp
+
+        # 1. Get to a healthy network: optional full restart, then wait for peers and
+        #    block production, restarting single stuck pods if needed
+        if ($doReset) { Reset-Network }
+        $meta.health     = Confirm-NetworkHealthy $runDir $meta.logStartUtc
+        $meta.healthyUtc = Get-UtcStamp
 
         $meta.validatorNode           = Get-PodField $validatorPod '{.spec.nodeName}'
         $meta.validatorRestartsBefore = Get-PodField $validatorPod '{.status.containerStatuses[0].restartCount}'
 
-        # 1. Stream the validator's logs (survives kubelet log rotation, which a one-off
-        #    'kubectl logs' at the end would not). After a reset the container is fresh,
-        #    so take its whole log to include startup; otherwise only from now on.
-        $logArgs = @('logs', '-f', '-n', $ns, $validatorPod)
-        if (-not $plan.resetNetwork) { $logArgs += '--tail=0' }
-        $logProc = Start-Process -FilePath $kubectl -ArgumentList $logArgs `
-            -RedirectStandardOutput $valLog -RedirectStandardError "$valLog.stderr" -NoNewWindow -PassThru
+        # 2. Stream the validator's logs (survives kubelet log rotation, which a one-off
+        #    'kubectl logs' at the end would not). --since-time backfills the reset and
+        #    health check, including the startup of a container restarted since then.
+        $logProc = Start-Process -FilePath $kubectl -NoNewWindow -PassThru `
+            -ArgumentList @('logs', '-f', '-n', $ns, $validatorPod, "--since-time=$($meta.logStartUtc)") `
+            -RedirectStandardOutput $valLog -RedirectStandardError "$valLog.stderr"
         Start-Sleep -Seconds 3
-        $meta.logStartUtc = Get-UtcStamp
 
-        # Let the restarted network settle, with the stream running so analysis can
-        # check blocks were being produced before load started
-        if ($plan.resetNetwork) {
+        # Let a restarted network or pod settle before load
+        $meta.warmupSeconds = 0
+        if ($doReset -or $meta.health.fixupRestarts.Count -gt 0) {
+            $meta.warmupSeconds = $warmupSeconds
             Write-Host "  Warming up for $warmupSeconds s ..."
             Start-Sleep -Seconds $warmupSeconds
         }
 
-        # 2. Start spamoor
+        # 3. Start spamoor
         Invoke-Native $kubectl @('apply', '-f', '-') -InputText $manifest | Out-Null
         $spamoorAlive = $true
         Invoke-Native $kubectl @('wait', '--for=condition=Ready', "pod/$podName", '-n', $ns, '--timeout=10m') | Out-Null
@@ -220,7 +400,7 @@ foreach ($run in $runs) {
         $meta.loadStartUtc = Get-UtcStamp
         Write-Host "  spamoor running on $($meta.spamoorNode); load for $($run.durationMinutes) min ..."
 
-        # 3. Sample CPU/memory until the duration is up
+        # 4. Sample CPU/memory until the duration is up
         $topFile = Join-Path $runDir 'top.log'
         $endAt   = (Get-Date).AddMinutes([double]$run.durationMinutes)
         while ((Get-Date) -lt $endAt) {
@@ -235,12 +415,12 @@ foreach ($run in $runs) {
         $meta.loadEndUtc   = Get-UtcStamp
         $meta.spamoorPhase = Get-PodField $podName '{.status.phase}'
 
-        # 4. Save spamoor's own logs, then stop it
+        # 5. Save spamoor's own logs, then stop it
         Save-NativeOutput $kubectl @('logs', '-n', $ns, $podName) (Join-Path $runDir 'spamoor.log')
         Invoke-Native $kubectl @('delete', 'pod', $podName, '-n', $ns, '--wait=true') | Out-Null
         $spamoorAlive = $false
 
-        # 5. Keep logging while the txpool drains
+        # 6. Keep logging while the txpool drains
         Write-Host "  Cooldown $cooldownSeconds s ..."
         Start-Sleep -Seconds $cooldownSeconds
     }
@@ -271,17 +451,19 @@ foreach ($run in $runs) {
 
     $meta | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $runDir 'meta.json') -Encoding UTF8
 
-    # 6. Package and publish
-    $zip = Join-Path $WorkRoot "$runId.zip"
+    # 7. Package and publish
+    $zip = Join-Path $workDir "$runId.zip"
     Compress-Archive -Path (Join-Path $runDir '*') -DestinationPath $zip -CompressionLevel Optimal -Force
     $zipMB = [Math]::Round((Get-Item $zip).Length / 1MB, 1)
     if ($zipMB -gt $MaxZipMB) {
-        Write-Warning "$runId.zip is $zipMB MB, too large for git. Left in $WorkRoot."
+        Write-Warning "$runId.zip is $zipMB MB, too large for git. Left in $workDir."
     } else {
         Copy-Item $zip $runsDir
         Write-Host "  Packaged $runId.zip ($zipMB MB)."
-        if (-not $NoPush) { Publish-Runs "spamoor run $runId" }
+        $label = $runId
+        if ($Group) { $label = "$Group/$runId" }
+        if ($Push) { Publish-Run (Join-Path $runsDir "$runId.zip") "spamoor run $label" }
     }
 }
 
-Write-Host "`nAll runs done. Local copies are in $WorkRoot."
+Write-Host "`nAll runs done. Local copies are in $workDir."

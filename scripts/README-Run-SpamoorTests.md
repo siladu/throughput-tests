@@ -1,13 +1,15 @@
 # Run-SpamoorTests.ps1
 
 Runs every load test listed in `test-plan.json`, one after another. For each run it
-captures the validator's logs and CPU/memory samples, then zips the results and pushes
-them to `runs/`. It runs on the VDS under Windows PowerShell 5.1.
+captures the validator's logs and CPU/memory samples, then zips the results into `runs/`
+and, with `-Push`, commits and pushes them. It runs on the VDS under Windows PowerShell 5.1.
 
 ```powershell
 git pull
-.\scripts\Run-SpamoorTests.ps1            # all runs, push each result as it finishes
-.\scripts\Run-SpamoorTests.ps1 -NoPush    # keep results local (still copied into runs/)
+.\scripts\Run-SpamoorTests.ps1                    # results go to runs\, not pushed
+.\scripts\Run-SpamoorTests.ps1 txpool-config      # results go to runs\txpool-config\
+.\scripts\Run-SpamoorTests.ps1 txpool-config -Push   # ... and commit + push each one
+.\scripts\Run-SpamoorTests.ps1 -NoReset           # skip the network restart this batch
 ```
 
 ## Overall shape
@@ -15,23 +17,26 @@ git pull
 For each entry in `test-plan.json`:
 
 ```
-[reset network] → start validator log stream → [warmup] → start spamoor → load + sample CPU/mem
-→ save spamoor log, kill spamoor → cooldown → stop stream → meta.json → zip → git push
+[reset network] → health check (+ fix-ups) → start validator log stream → [warmup]
+→ start spamoor → load + sample CPU/mem → save spamoor log, kill spamoor → cooldown
+→ stop stream → meta.json → zip → [git push]
 ```
 
 Each run is wrapped so that a failure is written into that run's `meta.json` and the loop
 moves on to the next run.
 
-Timeline of one run and the `meta.json` timestamps:
+Timeline of one run and the `meta.json` timestamps. `validator.log` covers all of it,
+from `logStartUtc` to `endUtc`:
 
 ```
-Reset-Network ──┬─ logStartUtc   validator log stream starts (after a reset: from container start)
-                │   ... warmup (idle, warmupSeconds) ...
-                ├─ loadStartUtc  spamoor pod Ready
-                │   ... load + top sampling ...
-                ├─ loadEndUtc    spamoor log saved, pod deleted
-                │   ... cooldown (txpool drains) ...
-                └─ endUtc        stream stopped, meta.json, zip, push
+logStartUtc ──┬─ ... reset (if enabled), health check, fix-up restarts ...
+              ├─ healthyUtc    every pod peered and the chain advancing
+              │   ... warmup (idle, warmupSeconds; only after a reset or fix-up) ...
+              ├─ loadStartUtc  spamoor pod Ready
+              │   ... load + top sampling ...
+              ├─ loadEndUtc    spamoor log saved, pod deleted
+              │   ... cooldown (txpool drains) ...
+              └─ endUtc        stream stopped, meta.json, zip, push
 ```
 
 ## Prerequisites on the VDS
@@ -41,6 +46,8 @@ Reset-Network ──┬─ logStartUtc   validator log stream starts (after a re
 | Spamoor private key | `$HOME\spamoor-privkey.txt` | Kept out of git; injected into the pod args at render time |
 | Image registry prefix | `$env:IMAGE_REGISTRY` | Kept out of git; prepended to the plan's `image` |
 | `kubectl`, `git` | on `PATH` | Cluster access and publishing results |
+| HTTP JSON-RPC on 8545 | every Besu pod | Health check (`net_peerCount`, `eth_blockNumber`) |
+| Local ports 18545 upwards | VDS | One `kubectl port-forward` per Besu pod during the health check |
 
 Set the registry once (it persists for your user). The second line covers the current
 shell, because already-open windows won't see the persisted value:
@@ -58,14 +65,27 @@ All parameters have defaults.
 
 | Parameter | Default | Notes |
 |---|---|---|
+| *(first positional)* `-Group` | none | Subfolder of `runs\` (and of `-WorkRoot`) for this batch, e.g. `txpool-config`. Letters, digits, `.`, `_`, `-`. Without it, zips go straight into `runs\` |
 | `-PlanFile` | `scripts\test-plan.json` | |
 | `-TemplateFile` | `scripts\spamoor-run.template.yml` | |
 | `-RepoRoot` | parent of `scripts\` | |
-| `-WorkRoot` | `$HOME\spamoor-runs` | Each run's files are built here before zipping. Outside the repo, so it keeps a full local copy of every run, including zips too big for git |
+| `-WorkRoot` | `$HOME\spamoor-runs` | Working folder outside the repo. Each run is built here as an unzipped folder, zipped here, and only the zip is copied into `runs\`. So the unzipped copy of every run is already here (no need to unzip into `runs\`), and zips too big for git stay here |
 | `-PrivKeyFile` | `$HOME\spamoor-privkey.txt` | |
 | `-Registry` | `$env:IMAGE_REGISTRY` | Registry + path prefix, without the image name |
 | `-MaxZipMB` | `95` | GitHub rejects files over 100 MB |
-| `-NoPush` | off | Still copies the zip into `runs/`, but skips the commit and push |
+| `-NoReset` | off | Skip the network restart even if the plan's `resetNetwork` is true. The health check still runs |
+| `-Push` | off | Commit and push each zip as it finishes. Without it, zips are copied into `runs\` and left uncommitted |
+
+## Plan settings for the health check
+
+| Field | Default if absent | Meaning |
+|---|---|---|
+| `minPeers` | 3 | Minimum `net_peerCount` for every Besu pod. Includes the RPC node, so 3 on a validator is not proof of 3 validator peers |
+| `healthTimeoutSeconds` | 300 | How long one health wait lasts before a fix-up (or giving up) |
+| `maxFixups` | 2 | Single-pod restarts allowed per run before the run is abandoned |
+
+Fixed in the script: the chain must advance 5 blocks, each pod must be within 2 blocks of
+the best head, polls every 10 s, RPC port 8545.
 
 ## Helpers
 
@@ -83,13 +103,22 @@ Most of these exist to work around Windows PowerShell 5.1:
   `Start-Process -RedirectStandardOutput` keeps the bytes as they are.
 - **`Get-PodField`** is a small `kubectl get pod -o jsonpath=…` wrapper. It returns
   `$null` on failure instead of throwing.
-- **`Reset-Network`**:
-  - It restarts **every statefulset at once**, which is the deliberate full-network
-    restart (all 4 validators plus the RPC node).
-  - It then waits on `rollout status` for each one, with a 15-minute timeout. The warmup
-    sleep happens later, once the log stream is running.
-- **`Publish-Runs`**:
-  - It stages **only `runs/`**, and commits only if something is actually staged.
+- **`Reset-Network`** is the deliberate full-network restart (all 4 validators plus the
+  RPC node):
+  - It scales **every statefulset to 0**, waits (printing progress) until every Besu pod
+    is gone, then scales each back to 1. Unlike `rollout restart`, no new node can peer
+    with an old one and be handed its pending transactions, so every txpool starts empty.
+  - Scaling back up is in a `finally`, so the network comes back even if the scale-down
+    fails part way. It always restores 1 replica (one pod per Helm release), which also
+    repairs a statefulset left at 0 by an earlier aborted batch.
+  - It then waits on `rollout status` for each one, with a 15-minute timeout. The pods
+    have no readiness probe, so this only means the containers have started, not that
+    Besu is peered. The health check covers that.
+- **`Wait-NetworkHealthy`**: the health check. See [Health check](#health-check-and-fix-ups).
+- **`Confirm-NetworkHealthy`**: the health check plus fix-up restarts.
+- **`Publish-Run`** (only with `-Push`):
+  - It stages and commits **only the zip it was given**, so unzipped folders under
+    `runs\` or anything you've staged by hand stay out of the commit.
   - It then tries `pull --rebase --autostash` + `push` up to 3 times with backoff, so
     pushes from the host while a batch is running don't break it.
   - If all attempts fail, the commit stays local and goes up with the next successful push.
@@ -98,6 +127,8 @@ Most of these exist to work around Windows PowerShell 5.1:
 
 - The plan and template are read **once at startup**. If you push a plan change
   mid-batch, the running batch ignores it; it applies from the next invocation.
+- The Besu pods to health-check are found once, by the label
+  `app.kubernetes.io/component=besu`, and printed.
 - Before the first run, any leftover pods labelled `app=spamoor` are deleted. So is the
   original hand-made `spamoor` pod, so an orphan from a crashed earlier batch can't add
   extra load.
@@ -118,19 +149,20 @@ Most of these exist to work around Windows PowerShell 5.1:
 
 ## The run itself
 
-1. **Reset and restart baseline**: if `resetNetwork` is set, the network is restarted.
-   The validator's restart count is read *after* the reset, so the before/after
-   comparison only covers this run.
-2. **Log stream**: `kubectl logs -f` runs as a **background process** writing to
-   `validator.log`.
-   - After a reset the container is fresh, so the stream takes its whole log, including
-     Besu startup and peering. Without a reset it adds `--tail=0` and captures nothing
-     from before this point.
+1. **Healthy network**: if resetting (plan's `resetNetwork` and no `-NoReset`), the
+   network is restarted. Then the health check runs, with fix-up restarts if needed. If
+   the network still isn't healthy, the run is abandoned before any load is sent. The
+   validator's restart count is read *after* this, so the before/after comparison only
+   covers the load.
+2. **Log stream**: `kubectl logs -f --since-time=<logStartUtc>` runs as a **background
+   process** writing to `validator.log`.
+   - `--since-time` backfills everything since the run began: the reset, Besu startup,
+     peering and the health check, even if the validator was restarted in between.
    - Streaming matters because kubelet rotates container logs, and a single
      `kubectl logs` at the end would lose the start of a long, noisy run.
    - A 3-second sleep lets the stream attach before anything else happens.
-3. **Warmup**: if `resetNetwork` is set, the network is left idle for `warmupSeconds`
-   while the stream records it (see [Warmup](#warmup)).
+3. **Warmup**: after a reset or a fix-up restart, the network is left idle for
+   `warmupSeconds` (see [Warmup](#warmup)).
 4. **Start spamoor**: the manifest is piped to `kubectl apply -f -`, then the script waits
    up to 10 minutes for the pod to be Ready. `loadStartUtc` is stamped once it's Ready.
 5. **Sampling loop**:
@@ -144,6 +176,41 @@ Most of these exist to work around Windows PowerShell 5.1:
 7. **Cooldown**: the validator stream keeps running for `cooldownSeconds` so the txpool
    draining is captured.
 
+## Health check and fix-ups
+
+A pod reporting Ready doesn't mean Besu is peered: after a full restart, one validator
+sometimes never connects to enough peers. So before any load, every run checks the
+network over RPC.
+
+- The VDS can't reach pod IPs, so the script runs one `kubectl port-forward` per Besu
+  pod (local ports 18545, 18546, …) and calls `net_peerCount` and `eth_blockNumber` on
+  each. A forward that fails is restarted on the next poll, so a pod that was just
+  replaced is picked up.
+- A pod is **unhealthy** if it doesn't answer RPC, has fewer than `minPeers` peers, or is
+  more than 2 blocks behind the best head.
+- The network is **healthy** when no pod is unhealthy and the best head has advanced at
+  least 5 blocks since the check began, which proves QBFT is producing blocks.
+- Every poll prints one progress line. Unhealthy pods are marked with `!`, and `p` is the
+  peer count:
+
+  ```
+    [00:40] rpc-1 4p #385437 | validator-1 3p #385437 | validator-2 1p #385430 ! | ... | +3/5 blocks
+  ```
+
+**Fix-ups.** If the network isn't healthy within `healthTimeoutSeconds`:
+
+1. The worst unhealthy pod (no RPC first, then fewest peers) has its logs saved as
+   `fixup-<n>-<pod>.log`, and is deleted. Its statefulset recreates it.
+2. The health check starts again.
+3. Only **one pod at a time** is restarted, so QBFT never loses quorum.
+4. After `maxFixups` restarts, or if the chain has stalled with no single unhealthy pod to
+   blame, the run is abandoned. The logs of the unhealthy pods (or of every pod, for a
+   stall) are saved as `unhealthy-<pod>.log`, and `meta.error` says why. The next run
+   tries again from the start.
+
+`meta.json` records `health`: `secondsToHealthy`, `fixupRestarts` (the pods restarted)
+and the final `peers` and `heads` per pod.
+
 ## Cleanup and packaging
 
 - **`catch`** stores the error message in `meta.error`, and the loop continues.
@@ -155,28 +222,26 @@ Most of these exist to work around Windows PowerShell 5.1:
 - **Fallback logs**: if the stream died, it saves `--since-time=logStartUtc` logs from the
   current container as `validator-fallback.log`. If the restart count also changed, it
   saves `--previous` as `validator-previous.log`, which is usually where an OOMKill shows up.
-- **Packaging**: writes `meta.json`, zips the run folder, and puts it in `runs/` and
-  pushes it if it's at most `-MaxZipMB`. A larger zip stays only in `-WorkRoot`.
+- **Packaging**: writes `meta.json` and zips the run folder. If the zip is at most
+  `-MaxZipMB`, it's copied into `runs\` (or `runs\<group>\`) and, with `-Push`, committed
+  and pushed. A larger zip stays only in `-WorkRoot`.
 
 ## Warmup
 
-`warmupSeconds` (60 in the current plan) is **idle time with no load**, and it only
-happens when `resetNetwork` is true. `meta.json` records the value used (0 without a
-reset).
+`warmupSeconds` (60 in the current plan) is **idle time with no load** after the health
+check passes. It only happens after a reset or a fix-up restart. `meta.json` records the
+value used (0 when skipped).
 
-- It starts after `rollout status` reports every statefulset rolled out, which means the
-  pods are Ready. It does not mean QBFT is producing blocks again.
-- Nothing is sent during it. It is time for the restarted validators to reconnect and
-  resume block production, not a load ramp-up.
-- It is recorded in `validator.log` (`logStartUtc` → `loadStartUtc`), along with the
-  validator's startup. Check that blocks were being produced before `loadStartUtc`.
+- The health check has already confirmed peering and block production, so this is extra
+  settle time for freshly started JVMs, not a wait for the network to come up.
+- It is recorded in `validator.log` (`healthyUtc` → `loadStartUtc`).
 - There is no load warmup. The first part of the load window includes spamoor's own
   startup (funding its child wallets before it reaches the requested rate) and Besu's JVM
   warming up under load. This is handled at analysis time by trimming the start of the
   load window; see "Analysing results" in `CLAUDE.md`.
 
-When `resetNetwork` is false there is no restart and no warmup sleep: the next run starts
-straight after the previous run's cooldown.
+Without a reset (and with no fix-ups), there's no warmup sleep: the next run starts once
+the health check passes after the previous run's cooldown.
 
 ## Known limitations
 
@@ -196,3 +261,5 @@ straight after the previous run's cooldown.
      `top.log`. Analysis should skip lines that don't parse.
    - The restart count reads `containerStatuses[0]`, which assumes the Besu pod has only
      one container.
+   - `--since-time` compares the VDS clock with the node's. If the VDS runs ahead, the
+     first few seconds of `validator.log` can be missing.

@@ -7,6 +7,9 @@
   "slotDuration": "2s",
   "resetNetwork": true,
   "warmupSeconds": 60,
+  "minPeers": 3,
+  "healthTimeoutSeconds": 300,
+  "maxFixups": 2,
   "cooldownSeconds": 60,
   "sampleSeconds": 30,
   "runs": [

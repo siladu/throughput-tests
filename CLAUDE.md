@@ -32,21 +32,39 @@ scripts/
   spamoor-run.template.yml    # spamoor pod manifest, rendered per run
   test-plan.json              # which runs to do, and settings
 runs/
-  <yyyyMMdd-HHmmss>-<name>.zip  # one zip per run, pushed from the VDS
+  <yyyyMMdd-HHmmss>-<name>.zip          # one zip per run, from the VDS
+  <group>/<yyyyMMdd-HHmmss>-<name>.zip  # when the runner was given a group name
 ```
 
 ## The test loop (Run-SpamoorTests.ps1)
 
+Invocation: `.\scripts\Run-SpamoorTests.ps1 [<group>] [-NoReset] [-Push]`. `<group>` is
+an optional subfolder of `runs/`. `-NoReset` overrides the plan's `resetNetwork`.
+Pushing is **off by default**: without `-Push` the zips land in `runs/` uncommitted, and
+the user commits and pushes them.
+
 Per run in `test-plan.json`:
 
-1. Optionally restart all statefulsets (`resetNetwork`).
-2. Start streaming the validator's logs (`kubectl logs -f`; from container start after a
-   reset, else `--tail=0`), then wait `warmupSeconds` if reset. Streaming is used instead
-   of a one-off `kubectl logs` because kubelet log rotation would drop lines.
-3. Render the template and apply the spamoor pod; wait for Ready.
-4. For `durationMinutes`, sample `kubectl top pods --containers` every `sampleSeconds`.
-5. Save spamoor's logs, delete its pod, keep logging for `cooldownSeconds` (txpool drain).
-6. Stop the stream, write `meta.json`, zip, copy into `runs/`, commit and push.
+1. Optionally reset the network (`resetNetwork`, unless `-NoReset`): scale every
+   statefulset to 0, wait until all Besu pods are gone, scale back to 1. Not
+   `rollout restart`, which lets new nodes peer with old ones and inherit their txpools.
+2. Health check: port-forward to every Besu pod and poll `net_peerCount` /
+   `eth_blockNumber` until each has `minPeers` peers, none lags, and the chain has
+   advanced. If it doesn't get there, restart the worst pod (one at a time, at most
+   `maxFixups`), then abandon the run if still unhealthy.
+3. Stream the validator's logs with `kubectl logs -f --since-time=<logStartUtc>`, which
+   backfills the reset and health check. Streaming is used instead of a one-off
+   `kubectl logs` because kubelet log rotation would drop lines. Then wait
+   `warmupSeconds` if there was a reset or fix-up.
+4. Render the template and apply the spamoor pod; wait for Ready.
+5. For `durationMinutes`, sample `kubectl top pods --containers` every `sampleSeconds`.
+6. Save spamoor's logs, delete its pod, keep logging for `cooldownSeconds` (txpool drain).
+7. Stop the stream, write `meta.json`, zip, copy into `runs/[<group>/]`, and with `-Push`
+   commit and push that zip only.
+
+The run is built unzipped in `$HOME\spamoor-runs\[<group>\]<runId>\` on the VDS (outside
+the repo) and zipped there; only the zip goes into `runs/`. Point the user there rather
+than unzipping into `runs/`.
 
 Errors in one run are recorded in `meta.json` and the loop moves on.
 
@@ -54,23 +72,31 @@ Errors in one run are recorded in `meta.json` and the loop moves on.
 
 Top level: `image` (`name:tag` only, no registry), `namespace`, `validatorPod`, `rpcUrl`,
 `scenario` (spamoor subcommand), `slotDuration`, `resetNetwork`, `warmupSeconds`,
-`cooldownSeconds`, `sampleSeconds`, `runs`.
+`minPeers`, `healthTimeoutSeconds`, `maxFixups`, `cooldownSeconds`, `sampleSeconds`, `runs`.
 
 Each run: `name` (becomes part of the run ID and pod name, keep it short, lowercase,
 `[a-z0-9-]`), `durationMinutes` (expected 5-15), `throughput` (spamoor `-t`), `amount`
 (spamoor `--amount`), optional `extraArgs` (array of extra spamoor CLI args).
 
 When editing the plan, tell the user the rough total wall time
-(sum of durations + per-run warmup/cooldown + a few minutes per network restart).
+(sum of durations + per-run warmup/cooldown + a few minutes per network restart and health
+check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are needed).
 
 ### Run zip contents
 
-- `validator.log`: Besu logs from one validator, covering just that run.
+- `validator.log`: Besu logs from one validator, covering just that run, including the
+  reset and health check.
 - `spamoor.log`: the load generator's own output.
 - `top.log`: `<UTC timestamp> <pod> <container> <cpu> <memory>` samples for every pod.
-- `meta.json`: parameters, UTC timestamps (`logStartUtc`, `loadStartUtc`, `loadEndUtc`,
-  `endUtc`), nodes used, validator restart counts before/after, `logStreamDiedEarly`,
-  `spamoorPhase`, `error` if any.
+- `meta.json`: parameters (incl. `group`, `resetNetwork`, `warmupSeconds`), UTC timestamps
+  (`logStartUtc`, `healthyUtc`, `loadStartUtc`, `loadEndUtc`, `endUtc`), `health`
+  (`secondsToHealthy`, `fixupRestarts`, final `peers`/`heads` per pod), nodes used,
+  validator restart counts before/after, `logStreamDiedEarly`, `spamoorPhase`, `error`
+  if any.
+- `fixup-<n>-<pod>.log`: logs of a pod the health check restarted, taken just before the
+  restart. Evidence for the startup peering race; worth reading when present.
+- `unhealthy-<pod>.log`: present when the run was abandoned because the network never
+  became healthy (no load was sent).
 - `validator-fallback.log` / `validator-previous.log`: only present if the validator
   restarted mid-run. A restart during a run usually means OOMKilled; flag it.
 
@@ -78,8 +104,8 @@ When editing the plan, tell the user the rough total wall time
 
 - Unzip into a scratch location outside the repo (or a gitignored folder), never into `runs/`.
 - Use `meta.json` timestamps to separate warmup, load and cooldown phases in the logs.
-- Check blocks were being produced during warmup (before `loadStartUtc`); if not, the
-  run started on an unsettled network.
+- Check `health` in `meta.json`: runs that needed fix-up restarts started with a freshly
+  restarted pod, so note them when comparing.
 - Steady-state metrics exclude the first 2 minutes after `loadStartUtc` (spamoor wallet
   funding/ramp, JVM JIT warmup), using the same time cut in all three logs. Before
   relying on the cut, check per-minute txs/block and achieved TPS have flattened by
@@ -121,6 +147,8 @@ Target **Windows PowerShell 5.1** unless told otherwise:
   5.1 turns any stderr line from kubectl/git into a terminating error.
 - No PowerShell 7-only syntax (`??`, `?.`, ternary, `-Parallel`, `&&`).
 - Quote kubectl jsonpath arguments (braces otherwise parse as script blocks).
+- Never put double quotes inside an argument to a native command (e.g. `{"\n"}` in a
+  jsonpath): 5.1 doesn't escape them, so kubectl receives them stripped.
 - Kubernetes names: lowercase `[a-z0-9-]`, max 63 characters.
 - Prefer small, reviewable diffs; the user can't easily debug on the VDS.
 
