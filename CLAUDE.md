@@ -66,7 +66,9 @@ Per run in `test-plan.json`:
 5. For `durationMinutes`, sample `kubectl top pods --containers` every `sampleSeconds`.
 6. Save spamoor's logs, delete its pod, keep logging for `cooldownSeconds` (txpool drain).
 7. Stop the stream, print a screen-sized summary (blocks and txs read from the chain,
-   tx/s achieved vs requested, CPU/memory, warnings), write `summary.txt` and `meta.json`,
+   tx/s achieved vs requested, gas per block / Mgas/s / % of gas limit, txs while spamoor
+   was stopping vs drained after, CPU/memory against limits with 95%+ flagged, warnings),
+   write `summary.txt` and `meta.json`,
    zip, copy into `runs/[<group>/]`, and with `-Push` commit and push that zip only.
 
 After the last run it prints a table comparing every run in the batch. That table and
@@ -101,8 +103,10 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
   `summary`).
 - `top.log`: `<UTC timestamp> <pod> <container> <cpu> <memory>` samples for every pod.
 - `meta.json`: parameters (incl. `group`, `resetNetwork`, `warmupSeconds`), UTC timestamps
-  (`logStartUtc`, `healthyUtc`, `loadStartUtc`, `loadEndUtc`, `endUtc`), `health`
-  (`secondsToHealthy`, `fixups`, final `peers`/`heads` per pod), nodes used,
+  (`logStartUtc`, `healthyUtc`, `loadStartUtc`, `loadEndUtc`, `spamoorStoppedUtc`,
+  `endUtc`; spamoor keeps sending between `loadEndUtc` and `spamoorStoppedUtc`, so the
+  txpool drain starts at the latter), `health` (`secondsToHealthy`, `fixups`, final
+  `peers`/`heads` per pod), `limits` (CPU/memory limit per `<pod>/<container>`), nodes used,
   validator restart counts before/after, `logStreamDiedEarly`, `spamoorPhase`, `error`
   if any.
 - `fixup-<n>-<pod>.log`: logs taken just before a fix-up (the restarted pod, or every pod
@@ -143,8 +147,10 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
 - Pods: `besu-node-validator-<N>-0`, `besu-node-rpc-1-0`. 4 QBFT validators, so consensus
   tolerates only one validator down. Don't suggest anything that takes down two at once
   except a deliberate full-network restart.
-- Each Besu pod: CPU 500m request / 1 limit, memory 1G request / 2G limit. Besu is a JVM:
-  memory problems show as OOMKilled, CPU limits as throttling.
+- Pod resource limits change between deployments (the 500m/1-core, 2G figures noted
+  earlier are out of date; the user reports 40 CPU request and limit). Don't assume them:
+  each run records every container's limits in `meta.limits` and the summary prints them.
+  Besu is a JVM: memory problems show as OOMKilled, CPU limits as throttling.
 - Node pool `besu` (taint `nodekind=besunode:NoSchedule`): one Besu pod per node via
   pod anti-affinity on `app.kubernetes.io/component=besu`. The load generator must
   tolerate the taint, require `kubernetes.azure.com/agentpool In (besu)` (otherwise it

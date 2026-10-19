@@ -1,5 +1,5 @@
 {
-  "image": "spamoor:v1.2.3",
+  "image": "spamoor:v1.2.4",
   "namespace": "besu-consensus",
   "validatorPod": "besu-node-validator-1-0",
   "rpcUrl": "http://besu-node-rpc-1-0.besu-node-rpc-1.besu-consensus.svc.cluster.local:8545",
@@ -14,6 +14,7 @@
   "runs": [
     { "name": "t2000", "durationMinutes": 10, "throughput": 2000, "amount": 50 },
     { "name": "t4000", "durationMinutes": 10, "throughput": 4000, "amount": 50 },
-    { "name": "t8000", "durationMinutes": 10, "throughput": 8000, "amount": 50 }
+    { "name": "t16000", "durationMinutes": 10, "throughput": 16000, "amount": 50,
+      "extraArgs": ["--max-pending", "1000000", "--max-wallets", "4000"] }
   ]
 }

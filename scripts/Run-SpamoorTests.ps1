@@ -343,20 +343,44 @@ function ConvertTo-Seconds([string]$Duration) {
     return [double]$Matches[1] * $factor
 }
 
-# kubectl top values: '512m' or '2' cores; '1650Mi', '2Gi', '900Ki' -> cores / MiB
+# kubectl top values and pod limits: '512m' or '2' cores; '1650Mi', '2Gi', '2G' -> cores / MiB
 function ConvertFrom-Cpu([string]$s) {
     if ($s -match '^(\d+)m$') { return [double]$Matches[1] / 1000 }
     if ($s -match '^[\d.]+$') { return [double]$s }
     return $null
 }
 function ConvertFrom-Mem([string]$s) {
-    if ($s -notmatch '^([\d.]+)(Ki|Mi|Gi|Ti)?$') { return $null }
-    $factor = @{ 'Ki' = 1 / 1024; 'Mi' = 1; 'Gi' = 1024; 'Ti' = 1048576; '' = 1 / 1MB }[[string]$Matches[2]]
+    if ($s -cnotmatch '^([\d.]+)(Ki|Mi|Gi|Ti|k|M|G|T)?$') { return $null }
+    $factor = @{
+        'Ki' = 1 / 1024; 'Mi' = 1; 'Gi' = 1024; 'Ti' = 1048576; '' = 1 / 1MB
+        'k' = 1e3 / 1MB; 'M' = 1e6 / 1MB; 'G' = 1e9 / 1MB; 'T' = 1e12 / 1MB
+    }[[string]$Matches[2]]
     return [double]$Matches[1] * $factor
 }
 function Format-Mem([double]$MiB) {
     if ($MiB -ge 1024) { return '{0:N1}Gi' -f ($MiB / 1024) }
     return '{0:N0}Mi' -f $MiB
+}
+
+# CPU/memory limits of every container in the namespace, keyed '<pod>/<container>' to
+# match top.log. Missing limits are $null. Empty if kubectl fails.
+function Get-ContainerLimits {
+    $limits = [ordered]@{}
+    $json = (Invoke-Native $kubectl @('get', 'pods', '-n', $ns, '-o', 'json') -AllowFailure) -join "`n"
+    if ($script:LastExit -ne 0) { return $limits }
+    try { $items = ($json | ConvertFrom-Json).items } catch { return $limits }
+    foreach ($p in $items) {
+        foreach ($c in $p.spec.containers) {
+            $l = $c.resources.limits
+            $limits["$($p.metadata.name)/$($c.name)"] = [ordered]@{ cpu = $l.cpu; memory = $l.memory }
+        }
+    }
+    return $limits
+}
+
+function Format-Gas([double]$Gas) {
+    if ($Gas -ge 1e9) { return '{0:N1} Ggas' -f ($Gas / 1e9) }
+    return '{0:N1} Mgas' -f ($Gas / 1e6)
 }
 
 # Blocks from the current head back to the first one stamped at or after $FromUnix,
@@ -368,10 +392,14 @@ function Get-BlocksSince([int]$Port, [long]$FromUnix) {
         $b  = Invoke-Rpc $Port 'eth_getBlockByNumber' ('"0x{0:x}",false' -f $n)
         $ts = ConvertFrom-Hex $b.timestamp
         if ($ts -lt $FromUnix) { break }
+        $gas      = ConvertFrom-Hex $b.gasUsed
+        $gasLimit = ConvertFrom-Hex $b.gasLimit
         $blocks.Add([pscustomobject]@{
-            Time   = $ts
-            Txs    = @($b.transactions).Count
-            GasPct = 100.0 * (ConvertFrom-Hex $b.gasUsed) / (ConvertFrom-Hex $b.gasLimit)
+            Time     = $ts
+            Txs      = @($b.transactions).Count
+            Gas      = $gas
+            GasLimit = $gasLimit
+            GasPct   = 100.0 * $gas / $gasLimit
         })
         $n--
     }
@@ -384,12 +412,15 @@ function Get-BlocksSince([int]$Port, [long]$FromUnix) {
 function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     $lines  = New-Object System.Collections.Generic.List[string]
     $reqTps = [double]$Run.throughput / (ConvertTo-Seconds $plan.slotDuration)
+    $extra  = @($Run.extraArgs | Where-Object { $_ }) -join ' '
     $row    = [ordered]@{
         Run = $Meta.name; 'Req tx/s' = [int]$reqTps; 'Tx/s' = ''; 'Tx/s 2m+' = ''; 'Tx/blk' = ''
-        'Blk s' = ''; 'Max gap' = ''; 'Besu CPU' = ''; 'Besu mem' = ''; Notes = ''
+        'Mgas/s' = ''; 'Gas %' = ''; 'Blk s' = ''; 'Max gap' = ''; 'Besu CPU' = ''; 'Besu mem' = ''
+        'Extra args' = $extra; Notes = ''
     }
     $notes = @()
     $lines.Add("--- Summary: $($Meta.runId) ---")
+    $lines.Add("spamoor $($plan.scenario) --slot-duration $($plan.slotDuration) -t $($Run.throughput) --amount $($Run.amount) $extra".TrimEnd())
 
     # Blocks and transactions, from the chain
     if ($Meta.loadStartUtc -and $Meta.loadEndUtc) {
@@ -402,9 +433,11 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
             $cool = @($blocks | Where-Object { $_.Time -gt $le })
             $secs = [Math]::Max(1, $le - $ls)
             if ($load.Count -ge 2) {
-                $txs  = ($load | Measure-Object -Property Txs -Sum -Maximum)
-                $gas  = ($load | Measure-Object -Property GasPct -Average -Maximum)
-                $tps  = $txs.Sum / $secs
+                $txs    = ($load | Measure-Object -Property Txs -Sum -Maximum)
+                $gas    = ($load | Measure-Object -Property Gas -Sum -Average -Maximum)
+                $gasPct = ($load | Measure-Object -Property GasPct -Average -Maximum)
+                $mgasPs = $gas.Sum / $secs / 1e6
+                $tps    = $txs.Sum / $secs
                 $span = $load[-1].Time - $load[0].Time
                 $maxGap = 0
                 for ($i = 1; $i -lt $load.Count; $i++) { $maxGap = [Math]::Max($maxGap, $load[$i].Time - $load[$i - 1].Time) }
@@ -419,20 +452,32 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
                     $row.'Tx/s 2m+' = '{0:N0}' -f $tps2
                 }
                 $lines.Add($tpsLine)
-                $lines.Add(('Tx/block avg {0:N0}, max {1}; gas used avg {2:N1}%, max {3:N1}%' -f ($txs.Sum / $load.Count), $txs.Maximum, $gas.Average, $gas.Maximum))
+                $lines.Add(('Tx/block avg {0:N0}, max {1}' -f ($txs.Sum / $load.Count), $txs.Maximum))
+                $lines.Add(('Gas/block avg {0}, max {1} = {2:N1} Mgas/s; {3:N2}% of the {4} limit avg, {5:N2}% max' -f
+                        (Format-Gas $gas.Average), (Format-Gas $gas.Maximum), $mgasPs, $gasPct.Average, (Format-Gas $load[-1].GasLimit), $gasPct.Maximum))
                 $row.'Tx/s'    = '{0:N0}' -f $tps
                 $row.'Tx/blk'  = '{0:N0}' -f ($txs.Sum / $load.Count)
+                $row.'Mgas/s'  = '{0:N1}' -f $mgasPs
+                $row.'Gas %'   = '{0:N2}' -f $gasPct.Average
                 $row.'Blk s'   = '{0:N2}' -f $avgBlk
                 $row.'Max gap' = $maxGap
             } else {
                 $lines.Add("Load: only $($load.Count) block(s) during the load window")
                 $notes += 'no blocks'
             }
-            $coolTxs   = ($cool | Measure-Object -Property Txs -Sum).Sum
-            $lastBusy  = @($cool | Where-Object { $_.Txs -gt 0 }) | Select-Object -Last 1
-            $drainNote = 'txpool empty at load end'
-            if ($lastBusy) { $drainNote = "last txs at +$($lastBusy.Time - $le) s" }
-            $lines.Add(('Cooldown: {0} blocks, {1:N0} txs ({2})' -f $cool.Count, [int]$coolTxs, $drainNote))
+            # spamoor keeps sending after loadEndUtc while its log is saved and its pod shuts
+            # down, so only blocks after spamoorStoppedUtc show the txpool draining
+            $st = $le
+            if ($Meta.spamoorStoppedUtc) { $st = [Math]::Max($le, (ConvertTo-Unix $Meta.spamoorStoppedUtc)) }
+            $stopping  = @($cool | Where-Object { $_.Time -le $st })
+            $drain     = @($cool | Where-Object { $_.Time -gt $st })
+            $stopTxs   = ($stopping | Measure-Object -Property Txs -Sum).Sum
+            $drainTxs  = ($drain | Measure-Object -Property Txs -Sum).Sum
+            $lastBusy  = @($drain | Where-Object { $_.Txs -gt 0 }) | Select-Object -Last 1
+            $drainNote = 'txpool empty when spamoor stopped'
+            if ($lastBusy) { $drainNote = "last txs at +$($lastBusy.Time - $st) s" }
+            $lines.Add(('Stopping spamoor ({0} s after load end): {1} blocks, {2:N0} txs' -f ($st - $le), $stopping.Count, [int]$stopTxs))
+            $lines.Add(('Drain after spamoor stopped: {0} blocks, {1:N0} txs ({2})' -f $drain.Count, [int]$drainTxs, $drainNote))
         } catch {
             $lines.Add("Block stats unavailable: $_")
             $notes += 'no block stats'
@@ -448,9 +493,11 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
         $lines.Add("Health: healthy after $($Meta.health.secondsToHealthy) s; fix-ups: $fx")
     }
 
-    # CPU / memory during load, from top.log
+    # CPU / memory during load, from top.log, against the limits read at load start
     $topFile = Join-Path $RunDir 'top.log'
     if ((Test-Path $topFile) -and $Meta.loadStartUtc -and $Meta.loadEndUtc) {
+        $limits = $Meta.limits
+        if (-not $limits) { $limits = @{} }
         $stats = @{}
         foreach ($l in [IO.File]::ReadLines($topFile)) {
             $f = $l -split '\s+'
@@ -460,17 +507,40 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
             $mem = ConvertFrom-Mem $f[4]
             if ($null -eq $cpu -or $null -eq $mem) { continue }
             $s = $stats[$f[1]]
-            if (-not $s) { $s = @{ CpuMax = 0.0; CpuSum = 0.0; N = 0; MemMax = 0.0 }; $stats[$f[1]] = $s }
+            if (-not $s) {
+                $s = @{ CpuMax = 0.0; CpuSum = 0.0; N = 0; MemMax = 0.0; CpuLim = $null; MemLim = $null; CpuPct = 0.0; MemPct = 0.0 }
+                $stats[$f[1]] = $s
+            }
             $s.CpuMax = [Math]::Max($s.CpuMax, $cpu); $s.CpuSum += $cpu; $s.N++
             $s.MemMax = [Math]::Max($s.MemMax, $mem)
+            $lim = $limits["$($f[1])/$($f[2])"]
+            if ($lim) {
+                $cl = ConvertFrom-Cpu $lim.cpu
+                $ml = ConvertFrom-Mem $lim.memory
+                if ($cl) { $s.CpuLim = $cl; $s.CpuPct = [Math]::Max($s.CpuPct, 100 * $cpu / $cl) }
+                if ($ml) { $s.MemLim = $ml; $s.MemPct = [Math]::Max($s.MemPct, 100 * $mem / $ml) }
+            }
         }
         if ($stats.Count -gt 0) {
-            $lines.Add('CPU cores max (avg), memory max during load:')
+            $lines.Add("CPU cores max (avg) / limit, memory max / limit, during load (! = $limitWarnPct%+ of limit):")
             foreach ($pod in ($stats.Keys | Sort-Object)) {
                 $s = $stats[$pod]
                 $label = Get-ShortName $pod
                 if ($pod -like 'spamoor-*') { $label = 'spamoor' }
-                $lines.Add(('  {0,-12} {1,5:N2} ({2:N2})  {3}' -f $label, $s.CpuMax, ($s.CpuSum / $s.N), (Format-Mem $s.MemMax)))
+                $cpuLim = '-'
+                if ($s.CpuLim) { $cpuLim = '{0:G4}' -f $s.CpuLim }
+                $memLim = '-'
+                if ($s.MemLim) { $memLim = Format-Mem $s.MemLim }
+                $flags = @()
+                if ($s.CpuPct -ge $limitWarnPct) { $flags += 'CPU {0:N0}%' -f $s.CpuPct }
+                if ($s.MemPct -ge $limitWarnPct) { $flags += 'mem {0:N0}%' -f $s.MemPct }
+                $flag = ''
+                if ($flags.Count -gt 0) {
+                    $flag = '  ! ' + ($flags -join ', ') + ' of limit'
+                    $notes += "$label " + ($flags -join ', ') + ' of limit'
+                }
+                $lines.Add(('  {0,-12} cpu {1,5:N2} ({2:N2}) / {3,-4} mem {4,6} / {5}{6}' -f
+                        $label, $s.CpuMax, ($s.CpuSum / $s.N), $cpuLim, (Format-Mem $s.MemMax), $memLim, $flag))
             }
             $besu = @($stats.Keys | Where-Object { $besuPods -contains $_ })
             if ($besu.Count -gt 0) {
@@ -581,6 +651,7 @@ $rpcPort              = 8545
 $rpcLocalPortBase     = 18545
 $peersConfigMap       = 'besu-peers'
 $summaryPort          = $rpcLocalPortBase + 100
+$limitWarnPct         = 95   # summary flags any container at or above this % of its CPU/memory limit
 
 $besuPods = @((Invoke-Native $kubectl @('get', 'pods', '-n', $ns, '-l', 'app.kubernetes.io/component=besu',
             '-o', 'jsonpath={.items[*].metadata.name}')) -join ' ' -split '\s+' | Where-Object { $_ } | Sort-Object)
@@ -701,6 +772,7 @@ foreach ($run in $runs) {
         $meta.spamoorNode  = Get-PodField $podName '{.spec.nodeName}'
         $meta.loadStartUtc = Get-UtcStamp
         Write-Host "  spamoor running on $($meta.spamoorNode); load for $($run.durationMinutes) min ..."
+        $meta.limits = Get-ContainerLimits
 
         # 4. Sample CPU/memory until the duration is up
         $topFile = Join-Path $runDir 'top.log'
@@ -721,6 +793,8 @@ foreach ($run in $runs) {
         Save-NativeOutput $kubectl @('logs', '-n', $ns, $podName) (Join-Path $runDir 'spamoor.log')
         Invoke-Native $kubectl @('delete', 'pod', $podName, '-n', $ns, '--wait=true') | Out-Null
         $spamoorAlive = $false
+        # Pod gone, so spamoor has stopped sending: some seconds after loadEndUtc
+        $meta.spamoorStoppedUtc = Get-UtcStamp
 
         # 6. Keep logging while the txpool drains
         Write-Host "  Cooldown $cooldownSeconds s ..."
@@ -783,7 +857,7 @@ foreach ($run in $runs) {
 }
 
 Write-Host "`n=== Batch summary: $($summaryRows.Count) run(s), load window only; 2m+ excludes the first 2 min ==="
-$summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Tx/blk', 'Blk s', 'Max gap', 'Besu CPU', 'Besu mem', Notes |
+$summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
     Out-String -Width 300 | Write-Host
 
 Write-Host "All runs done. Local copies are in $workDir."

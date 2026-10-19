@@ -40,7 +40,8 @@ logStartUtc ──┬─ ... reset (if enabled), health check, fix-ups ...
               │   ... warmup (idle, warmupSeconds; only after a reset or fix-up) ...
               ├─ loadStartUtc  spamoor pod Ready
               │   ... load + top sampling ...
-              ├─ loadEndUtc    spamoor log saved, pod deleted
+              ├─ loadEndUtc    duration up; spamoor still sending while its log is saved
+              ├─ spamoorStoppedUtc  spamoor pod deleted (it has stopped sending)
               │   ... cooldown (txpool drains) ...
               └─ endUtc        stream stopped, meta.json, zip, push
 ```
@@ -173,6 +174,8 @@ Most of these exist to work around Windows PowerShell 5.1:
    `warmupSeconds` (see [Warmup](#warmup)).
 4. **Start spamoor**: the manifest is piped to `kubectl apply -f -`, then the script waits
    up to 10 minutes for the pod to be Ready. `loadStartUtc` is stamped once it's Ready.
+   Then every container's CPU/memory limits are read from the pod specs into
+   `meta.limits` (`<pod>/<container>` → `cpu`, `memory`) for the summary.
 5. **Sampling loop**:
    - Every `sampleSeconds` it appends `kubectl top pods --containers` to `top.log`, with
      a UTC timestamp at the start of each line.
@@ -180,7 +183,8 @@ Most of these exist to work around Windows PowerShell 5.1:
      `Running` (for example, if it crashed).
    - The last sleep is cut short so the load phase ends on time.
 6. **Spamoor teardown**: spamoor's logs are saved *before* the pod is deleted, because
-   deleting it discards them.
+   deleting it discards them. spamoor keeps sending during this, and through its
+   graceful shutdown, so `spamoorStoppedUtc` is stamped once the pod is gone.
 7. **Cooldown**: the validator stream keeps running for `cooldownSeconds` so the txpool
    draining is captured.
 
@@ -239,16 +243,19 @@ prints a summary that fits on one screen, and saves it as `summary.txt` and in
 
 ```
   --- Summary: 20261016-140623-t2000 ---
+  spamoor eoatx --slot-duration 2s -t 2000 --amount 50
   Load 10.0 min: 300 blocks, avg 2.00 s, max gap 4 s
   598,000 txs = 996.7 tx/s (requested 1,000 tx/s = 2000 per 2s slot); after first 2 min 1,000.1 tx/s
-  Tx/block avg 1,993, max 2000; gas used avg 41.9%, max 42.0%
-  Cooldown: 30 blocks, 0 txs (txpool empty at load end)
+  Tx/block avg 1,993, max 2000
+  Gas/block avg 41.9 Mgas, max 42.0 Mgas = 20.9 Mgas/s; 41.86% of the 100.0 Mgas limit avg, 42.00% max
+  Stopping spamoor (6 s after load end): 3 blocks, 6,000 txs
+  Drain after spamoor stopped: 27 blocks, 0 txs (txpool empty when spamoor stopped)
   Health: healthy after 33 s; fix-ups: none
-  CPU cores max (avg), memory max during load:
-    rpc-1         0.95 (0.70)  1.7Gi
-    validator-1   0.98 (0.71)  1.8Gi
+  CPU cores max (avg) / limit, memory max / limit, during load (! = 95%+ of limit):
+    rpc-1        cpu  0.95 (0.70) / 40   mem  1.7Gi / 1.9Gi
+    validator-1  cpu  0.98 (0.71) / 40   mem  1.8Gi / 1.9Gi  ! mem 95% of limit
     ...
-    spamoor       3.20 (2.50)  2.1Gi
+    spamoor      cpu  3.20 (2.50) / 40   mem  2.1Gi / 160.0Gi
   validator restarts 0 -> 0; validator.log WARN 3, ERROR 0
         3 x WARN RoundTimer | ...
   spamoor.log error lines: 0
@@ -266,16 +273,26 @@ Where each figure comes from:
   time, that assumption holds.
 - **"After first 2 min"** uses the same cut as the analysis rule in `CLAUDE.md` (spamoor
   ramp-up, JVM warmup). It's only shown for load windows over 3 minutes.
-- **Cooldown** shows whether the txpool was still draining after the load stopped.
-- **CPU/memory**: `top.log` samples inside the load window. Besu's limit is 1 core and
-  2G, so a max near 1.00 cores means throttling and memory near 2Gi means OOM risk.
+- **Gas**: absolute gas per block and Mgas/s (total gas in the load window over its
+  length), plus gas used as a % of the block gas limit (the limit shown is the last
+  load block's).
+- **Stopping / drain**: the cooldown is split at `spamoorStoppedUtc`. *Stopping* is
+  `loadEndUtc` → `spamoorStoppedUtc`, when spamoor was still sending. *Drain* is after
+  that, so its txs (and "last txs at +N s") show the txpool emptying with no new load.
+  Runs from before `spamoorStoppedUtc` existed count everything as drain.
+- **CPU/memory**: `top.log` samples inside the load window, against the container limits
+  in `meta.limits` (`-` if none). Memory limits are converted to Gi, so a decimal `2G`
+  shows as `1.9Gi`. Any container whose max reaches 95% of a limit is marked `!` and
+  named in the table's notes: near the CPU limit means throttling, near memory means OOM
+  risk.
 - **Warnings/errors**: counts of `WARN`/`ERROR` in `validator.log` (the whole run, not
   just the load), with the three most common messages (numbers and hashes blanked so
   repeats group). `spamoor.log` lines containing "error".
 
 The end-of-batch table has one row per run: requested and achieved tx/s (also after the
-first 2 minutes), tx/block, average block time, max gap, the highest Besu CPU and memory
-(and which pod), and notes such as errors, fix-ups, restarts. If the summary itself
+first 2 minutes), tx/block, Mgas/s, average gas used %, average block time, max gap, the
+highest Besu CPU and memory (and which pod), the run's `extraArgs`, and notes such as
+errors, fix-ups, restarts and containers at 95%+ of a limit. If the summary itself
 fails, the run is still packaged and the table row says why.
 
 ## Cleanup and packaging
