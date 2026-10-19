@@ -177,6 +177,23 @@ function Save-PodLog([string]$Pod, [string]$Since, [string]$Path) {
     Save-NativeOutput $kubectl @('logs', '-n', $ns, $Pod, "--since-time=$Since") $Path
 }
 
+# Follows a pod's logs into $Path in the background, from $Since (or the container's
+# start). Survives kubelet log rotation, which a one-off 'kubectl logs' at the end would
+# not. Ends by itself when the container stops.
+function Start-LogStream([string]$Pod, [string]$Path, [string]$Since) {
+    $a = @('logs', '-f', '-n', $ns, $Pod)
+    if ($Since) { $a += "--since-time=$Since" }
+    Start-Process -FilePath $kubectl -NoNewWindow -PassThru -ArgumentList $a `
+        -RedirectStandardOutput $Path -RedirectStandardError "$Path.stderr"
+}
+
+# Gives a stream up to $WaitSeconds to finish by itself (its container stopping), then kills it
+function Stop-LogStream($Proc, [int]$WaitSeconds = 0) {
+    if (-not $Proc) { return }
+    if ($WaitSeconds -gt 0 -and -not $Proc.HasExited) { $Proc.WaitForExit($WaitSeconds * 1000) | Out-Null }
+    if (-not $Proc.HasExited) { Stop-Process -Id $Proc.Id -Force }
+}
+
 # Polls every Besu pod's RPC (through kubectl port-forward) until each is connected to all
 # of its static peers and within $maxBlocksBehind of the best head, and the best head has
 # advanced $minNewBlocks since polling began. A pod missing static peers is asked to dial
@@ -476,7 +493,9 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
             $lastBusy  = @($drain | Where-Object { $_.Txs -gt 0 }) | Select-Object -Last 1
             $drainNote = 'txpool empty when spamoor stopped'
             if ($lastBusy) { $drainNote = "last txs at +$($lastBusy.Time - $st) s" }
-            $lines.Add(('Stopping spamoor ({0} s after load end): {1} blocks, {2:N0} txs' -f ($st - $le), $stopping.Count, [int]$stopTxs))
+            $delNote = ''
+            if ($null -ne $Meta.spamoorDeleteSeconds) { $delNote = "; pod delete took $($Meta.spamoorDeleteSeconds) s" }
+            $lines.Add(('Stopping spamoor ({0} s after load end{1}): {2} blocks, {3:N0} txs' -f ($st - $le), $delNote, $stopping.Count, [int]$stopTxs))
             $lines.Add(('Drain after spamoor stopped: {0} blocks, {1:N0} txs ({2})' -f $drain.Count, [int]$drainTxs, $drainNote))
         } catch {
             $lines.Add("Block stats unavailable: $_")
@@ -573,10 +592,38 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     } else {
         $lines.Add($restart)
     }
+    # spamoor: did it run the whole window, and what did it complain about
+    foreach ($f in @($Meta.spamoorFailures)) {
+        if (-not $f) { continue }
+        $lines.Add("spamoor attempt $($f.attempt): $($f.phase) $($f.secondsAfterStart) s after start; restarted (log in spamoor-failed-$($f.attempt).log)")
+        $notes += "spamoor retried ($($f.phase) at +$($f.secondsAfterStart) s)"
+    }
+    if ($Meta.spamoorPhase -and $Meta.spamoorPhase -ne 'Running' -and $Meta.loadStartUtc -and $Meta.loadEndUtc) {
+        $ran = ((ConvertTo-Unix $Meta.loadEndUtc) - (ConvertTo-Unix $Meta.loadStartUtc)) / 60
+        $lines.Add(('spamoor {0} after {1:N1} of {2} min: load window cut short, run not comparable' -f $Meta.spamoorPhase, $ran, $Run.durationMinutes))
+        $notes = @(('SPAMOOR {0} at {1:N1} min' -f $Meta.spamoorPhase.ToUpper(), $ran)) + $notes
+    }
     $spamLog = Join-Path $RunDir 'spamoor.log'
     if (Test-Path $spamLog) {
-        $spamErrors = @(Select-String -Path $spamLog -Pattern '(?i)level=error|\berror\b').Count
-        $lines.Add("spamoor.log error lines: $spamErrors")
+        # Can be 1 GB+ when the network is overloaded, so one streaming pass, with the
+        # most common warning/error messages counted (numbers and hex blanked)
+        $spamErrors = 0; $spamWarns = 0
+        $msgCounts  = @{}
+        foreach ($l in [IO.File]::ReadLines($spamLog)) {
+            if ($l.Contains('level=error') -or $l.StartsWith('panic:')) { $spamErrors++ }
+            elseif ($l.Contains('level=warning')) { $spamWarns++ }
+            else { continue }
+            $msg = $l
+            $i = $l.IndexOf('msg=')
+            if ($i -ge 0) { $msg = $l.Substring($i + 4) }
+            if ($msg.Length -gt 120) { $msg = $msg.Substring(0, 120) }
+            $msg = $msg -replace '0x[0-9a-fA-F]+', '0x..' -replace '\d+', 'N'
+            $msgCounts[$msg] = 1 + [int]$msgCounts[$msg]
+        }
+        $mb = (Get-Item $spamLog).Length / 1MB
+        $lines.Add(('spamoor.log {0:N1} MB: error lines {1}, warning lines {2:N0}' -f $mb, $spamErrors, $spamWarns))
+        $msgCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 3 |
+            ForEach-Object { $lines.Add(('  {0,7:N0} x {1}' -f $_.Value, $_.Key)) }
         if ($spamErrors -gt 0) { $notes += "spamoor errors $spamErrors" }
     }
 
@@ -652,10 +699,22 @@ $rpcLocalPortBase     = 18545
 $peersConfigMap       = 'besu-peers'
 $summaryPort          = $rpcLocalPortBase + 100
 $limitWarnPct         = 95   # summary flags any container at or above this % of its CPU/memory limit
+$spamoorRetrySeconds  = 60   # spamoor exiting this soon after Ready is retried (once) ...
+$spamoorMaxAttempts   = 2    # ... up to this many starts in total
+$spamoorGraceSeconds  = 5    # SIGTERM -> SIGKILL when stopping spamoor; it keeps sending until gone
+$slowDeleteSeconds    = 60   # a spamoor pod delete slower than this is warned about, with its events saved
+
+# The RPC node spamoor sends to (first label of rpcUrl's host), unless the plan names one
+$rpcPod = $plan.rpcPod
+if (-not $rpcPod) { $rpcPod = ([Uri]$plan.rpcUrl).Host.Split('.')[0] }
 
 $besuPods = @((Invoke-Native $kubectl @('get', 'pods', '-n', $ns, '-l', 'app.kubernetes.io/component=besu',
             '-o', 'jsonpath={.items[*].metadata.name}')) -join ' ' -split '\s+' | Where-Object { $_ } | Sort-Object)
 if ($besuPods.Count -eq 0) { throw "No Besu pods (app.kubernetes.io/component=besu) found in $ns." }
+if ($besuPods -notcontains $rpcPod) {
+    Write-Warning "RPC pod '$rpcPod' (from rpcUrl) isn't a Besu pod in $ns; rpc.log won't be captured. Set rpcPod in the plan."
+    $rpcPod = $null
+}
 
 # Static peers, from the configmap every Besu pod mounts. The pod name is the first label
 # of each enode's host; the public key maps admin_peers results back to pods.
@@ -733,7 +792,11 @@ foreach ($run in $runs) {
     }
 
     $valLog       = Join-Path $runDir 'validator.log'
+    $rpcLog       = Join-Path $runDir 'rpc.log'
+    $spamLog      = Join-Path $runDir 'spamoor.log'
     $logProc      = $null
+    $rpcLogProc   = $null
+    $spamLogProc  = $null
     $spamoorAlive = $false
 
     try {
@@ -749,12 +812,10 @@ foreach ($run in $runs) {
         $meta.validatorNode           = Get-PodField $validatorPod '{.spec.nodeName}'
         $meta.validatorRestartsBefore = Get-PodField $validatorPod '{.status.containerStatuses[0].restartCount}'
 
-        # 2. Stream the validator's logs (survives kubelet log rotation, which a one-off
-        #    'kubectl logs' at the end would not). --since-time backfills the reset and
-        #    health check, including the startup of a container restarted since then.
-        $logProc = Start-Process -FilePath $kubectl -NoNewWindow -PassThru `
-            -ArgumentList @('logs', '-f', '-n', $ns, $validatorPod, "--since-time=$($meta.logStartUtc)") `
-            -RedirectStandardOutput $valLog -RedirectStandardError "$valLog.stderr"
+        # 2. Stream the validator's and the RPC node's logs. --since-time backfills the reset
+        #    and health check, including the startup of a container restarted since then.
+        $logProc = Start-LogStream $validatorPod $valLog $meta.logStartUtc
+        if ($rpcPod) { $rpcLogProc = Start-LogStream $rpcPod $rpcLog $meta.logStartUtc }
         Start-Sleep -Seconds 3
 
         # Let a restarted network or pod settle before load
@@ -765,36 +826,71 @@ foreach ($run in $runs) {
             Start-Sleep -Seconds $warmupSeconds
         }
 
-        # 3. Start spamoor
-        Invoke-Native $kubectl @('apply', '-f', '-') -InputText $manifest | Out-Null
-        $spamoorAlive = $true
-        Invoke-Native $kubectl @('wait', '--for=condition=Ready', "pod/$podName", '-n', $ns, '--timeout=10m') | Out-Null
-        $meta.spamoorNode  = Get-PodField $podName '{.spec.nodeName}'
-        $meta.loadStartUtc = Get-UtcStamp
-        Write-Host "  spamoor running on $($meta.spamoorNode); load for $($run.durationMinutes) min ..."
-        $meta.limits = Get-ContainerLimits
-
-        # 4. Sample CPU/memory until the duration is up
+        # 3. Start spamoor, streaming its log from the start. If it exits within
+        #    $spamoorRetrySeconds (e.g. a transient RPC error while preparing wallets),
+        #    keep that log as spamoor-failed-<n>.log and start it again.
         $topFile = Join-Path $runDir 'top.log'
-        $endAt   = (Get-Date).AddMinutes([double]$run.durationMinutes)
-        while ((Get-Date) -lt $endAt) {
-            $ts = Get-UtcStamp
-            Invoke-Native $kubectl @('top', 'pods', '-n', $ns, '--containers', '--no-headers') -AllowFailure |
-                ForEach-Object { "$ts $_" } | Add-Content -Path $topFile
-            $phase = Get-PodField $podName '{.status.phase}'
-            if ($phase -ne 'Running') { Write-Warning "spamoor stopped early (phase: $phase)"; break }
-            $left = ($endAt - (Get-Date)).TotalSeconds
-            if ($left -gt 0) { Start-Sleep -Seconds ([int][Math]::Ceiling([Math]::Min([double]$sampleSeconds, $left))) }
-        }
-        $meta.loadEndUtc   = Get-UtcStamp
-        $meta.spamoorPhase = Get-PodField $podName '{.status.phase}'
+        $meta.spamoorFailures = @()
+        $attempt = 0
+        while ($true) {
+            $attempt++
+            Invoke-Native $kubectl @('apply', '-f', '-') -InputText $manifest | Out-Null
+            $spamoorAlive = $true
+            Invoke-Native $kubectl @('wait', '--for=condition=Ready', "pod/$podName", '-n', $ns, '--timeout=10m') | Out-Null
+            $spamLogProc = Start-LogStream $podName $spamLog ''
+            $startedAt         = Get-Date
+            $meta.spamoorNode  = Get-PodField $podName '{.spec.nodeName}'
+            $meta.loadStartUtc = Get-UtcStamp
+            Write-Host "  spamoor running on $($meta.spamoorNode); load for $($run.durationMinutes) min ..."
+            $meta.limits = Get-ContainerLimits
 
-        # 5. Save spamoor's own logs, then stop it
-        Save-NativeOutput $kubectl @('logs', '-n', $ns, $podName) (Join-Path $runDir 'spamoor.log')
-        Invoke-Native $kubectl @('delete', 'pod', $podName, '-n', $ns, '--wait=true') | Out-Null
+            # 4. Sample CPU/memory until the duration is up
+            $endAt   = $startedAt.AddMinutes([double]$run.durationMinutes)
+            $restart = $false
+            while ((Get-Date) -lt $endAt) {
+                $ts = Get-UtcStamp
+                Invoke-Native $kubectl @('top', 'pods', '-n', $ns, '--containers', '--no-headers') -AllowFailure |
+                    ForEach-Object { "$ts $_" } | Add-Content -Path $topFile
+                $phase = Get-PodField $podName '{.status.phase}'
+                if ($phase -ne 'Running') {
+                    $secs = [int]((Get-Date) - $startedAt).TotalSeconds
+                    # Only a pod that has really finished; $null may be an API blip
+                    $exited  = @('Failed', 'Succeeded') -contains $phase
+                    $restart = $exited -and $secs -le $spamoorRetrySeconds -and $attempt -lt $spamoorMaxAttempts
+                    if (-not $restart) { Write-Warning "spamoor stopped early (phase: $phase, $secs s after start)" }
+                    break
+                }
+                $left = ($endAt - (Get-Date)).TotalSeconds
+                if ($left -gt 0) { Start-Sleep -Seconds ([int][Math]::Ceiling([Math]::Min([double]$sampleSeconds, $left))) }
+            }
+            if (-not $restart) { break }
+
+            $meta.spamoorFailures += [ordered]@{ attempt = $attempt; phase = $phase; secondsAfterStart = $secs; startUtc = $meta.loadStartUtc }
+            Write-Warning "spamoor $phase $secs s after starting; log kept as spamoor-failed-$attempt.log. Starting it again ..."
+            Stop-LogStream $spamLogProc 10
+            Move-Item $spamLog (Join-Path $runDir "spamoor-failed-$attempt.log") -Force
+            Remove-EmptyFile "$spamLog.stderr"
+            if (Test-Path "$spamLog.stderr") { Move-Item "$spamLog.stderr" (Join-Path $runDir "spamoor-failed-$attempt.log.stderr") -Force }
+            Invoke-Native $kubectl @('delete', 'pod', $podName, '-n', $ns, '--wait=true') | Out-Null
+            $spamoorAlive = $false
+        }
+        $meta.spamoorAttempts = $attempt
+        $meta.loadEndUtc      = Get-UtcStamp
+        $meta.spamoorPhase    = Get-PodField $podName '{.status.phase}'
+
+        # 5. Stop spamoor. Its log is already streamed, so it goes straight away; it keeps
+        #    sending until the pod is gone. A slow delete is timed and its events saved.
+        $t = Get-Date
+        Invoke-Native $kubectl @('delete', 'pod', $podName, '-n', $ns, "--grace-period=$spamoorGraceSeconds", '--wait=true') | Out-Null
         $spamoorAlive = $false
-        # Pod gone, so spamoor has stopped sending: some seconds after loadEndUtc
-        $meta.spamoorStoppedUtc = Get-UtcStamp
+        $meta.spamoorStoppedUtc    = Get-UtcStamp
+        $meta.spamoorDeleteSeconds = [int]((Get-Date) - $t).TotalSeconds
+        if ($meta.spamoorDeleteSeconds -gt $slowDeleteSeconds) {
+            Write-Warning "Deleting spamoor's pod took $($meta.spamoorDeleteSeconds) s (grace period $spamoorGraceSeconds s); events in spamoor-events.log"
+            Save-NativeOutput $kubectl @('get', 'events', '-n', $ns, "--field-selector=involvedObject.name=$podName",
+                '-o', 'custom-columns=TIME:.lastTimestamp,TYPE:.type,REASON:.reason,MESSAGE:.message') (Join-Path $runDir 'spamoor-events.log')
+        }
+        Stop-LogStream $spamLogProc 10
 
         # 6. Keep logging while the txpool drains
         Write-Host "  Cooldown $cooldownSeconds s ..."
@@ -805,11 +901,14 @@ foreach ($run in $runs) {
         Write-Warning "Run $runId hit an error: $_"
     }
     finally {
-        $meta.logStreamDiedEarly = [bool]($logProc -and $logProc.HasExited)
-        if ($logProc -and -not $logProc.HasExited) { Stop-Process -Id $logProc.Id -Force }
+        $meta.logStreamDiedEarly    = [bool]($logProc -and $logProc.HasExited)
+        $meta.rpcLogStreamDiedEarly = [bool]($rpcLogProc -and $rpcLogProc.HasExited)
+        Stop-LogStream $logProc
+        Stop-LogStream $rpcLogProc
         if ($spamoorAlive) {
-            Invoke-Native $kubectl @('delete', 'pod', $podName, '-n', $ns, '--ignore-not-found', '--wait=true') -AllowFailure | Out-Null
+            Invoke-Native $kubectl @('delete', 'pod', $podName, '-n', $ns, '--ignore-not-found', "--grace-period=$spamoorGraceSeconds", '--wait=true') -AllowFailure | Out-Null
         }
+        Stop-LogStream $spamLogProc
     }
 
     $meta.endUtc                 = Get-UtcStamp
@@ -823,7 +922,7 @@ foreach ($run in $runs) {
             Save-NativeOutput $kubectl @('logs', '-n', $ns, $validatorPod, '--previous') (Join-Path $runDir 'validator-previous.log')
         }
     }
-    Remove-EmptyFile "$valLog.stderr"
+    foreach ($f in @($valLog, $rpcLog, $spamLog)) { Remove-EmptyFile "$f.stderr" }
 
     # Summary for the console (results don't come back through git), summary.txt and meta.json
     Write-Host '  Summarising (reads the run''s blocks over RPC) ...'

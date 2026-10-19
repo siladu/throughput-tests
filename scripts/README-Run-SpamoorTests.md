@@ -20,9 +20,10 @@ git pull
 For each entry in `test-plan.json`:
 
 ```
-[reset network] → health check (+ fix-ups) → start validator log stream → [warmup]
-→ start spamoor → load + sample CPU/mem → save spamoor log, kill spamoor → cooldown
-→ stop stream → summary → meta.json → zip → [git push]
+[reset network] → health check (+ fix-ups) → start validator + rpc log streams → [warmup]
+→ start spamoor + its log stream [→ retry once if it dies in the first minute]
+→ load + sample CPU/mem → delete spamoor → cooldown → stop streams → summary
+→ meta.json → zip → [git push]
 ```
 
 After the last run it prints a table comparing all runs in the batch. See
@@ -31,17 +32,17 @@ After the last run it prints a table comparing all runs in the batch. See
 Each run is wrapped so that a failure is written into that run's `meta.json` and the loop
 moves on to the next run.
 
-Timeline of one run and the `meta.json` timestamps. `validator.log` covers all of it,
-from `logStartUtc` to `endUtc`:
+Timeline of one run and the `meta.json` timestamps. `validator.log` and `rpc.log` cover
+all of it, from `logStartUtc` to `endUtc`:
 
 ```
 logStartUtc ──┬─ ... reset (if enabled), health check, fix-ups ...
               ├─ healthyUtc    every pod peered with all its static peers, chain advancing
               │   ... warmup (idle, warmupSeconds; only after a reset or fix-up) ...
-              ├─ loadStartUtc  spamoor pod Ready
+              ├─ loadStartUtc  spamoor pod Ready (the retry's, if it was restarted)
               │   ... load + top sampling ...
-              ├─ loadEndUtc    duration up; spamoor still sending while its log is saved
-              ├─ spamoorStoppedUtc  spamoor pod deleted (it has stopped sending)
+              ├─ loadEndUtc    duration up; spamoor still sending while its pod is deleted
+              ├─ spamoorStoppedUtc  spamoor pod gone (it has stopped sending)
               │   ... cooldown (txpool drains) ...
               └─ endUtc        stream stopped, meta.json, zip, push
 ```
@@ -90,6 +91,7 @@ All parameters have defaults.
 |---|---|---|
 | `healthTimeoutSeconds` | 300 | How long one health wait lasts before a fix-up (or giving up) |
 | `maxFixups` | 2 | Fix-ups (full reset or single-pod restart) allowed per run before the run is abandoned |
+| `rpcPod` | first label of `rpcUrl`'s host | Pod whose log is streamed as `rpc.log` (the node spamoor sends to) |
 
 Fixed in the script: every pod must be connected to every other running pod in the
 `besu-peers` configmap, the chain must advance 5 blocks, each pod must be within 2 blocks
@@ -109,6 +111,10 @@ Most of these exist to work around Windows PowerShell 5.1:
 - **`Save-NativeOutput`** writes a command's output straight to a file. In 5.1, `>`
   re-encodes output as UTF-16, which doubles the size of large logs. Going through
   `Start-Process -RedirectStandardOutput` keeps the bytes as they are.
+- **`Start-LogStream` / `Stop-LogStream`** run `kubectl logs -f` as a background process
+  writing to a file, and stop it (optionally giving it a few seconds to end by itself
+  first, as it does when its container stops). Used for `validator.log`, `rpc.log` and
+  `spamoor.log`.
 - **`Get-PodField`** is a small `kubectl get pod -o jsonpath=…` wrapper. It returns
   `$null` on failure instead of throwing.
 - **`Reset-Network`** is the deliberate full-network restart (all 4 validators plus the
@@ -163,30 +169,42 @@ Most of these exist to work around Windows PowerShell 5.1:
    the network still isn't healthy, the run is abandoned before any load is sent. The
    validator's restart count is read *after* this, so the before/after comparison only
    covers the load.
-2. **Log stream**: `kubectl logs -f --since-time=<logStartUtc>` runs as a **background
-   process** writing to `validator.log`.
+2. **Log streams**: `kubectl logs -f --since-time=<logStartUtc>` runs as a **background
+   process** for the validator (`validator.log`) and for the RPC node spamoor sends to
+   (`rpc.log`, see `rpcPod`).
    - `--since-time` backfills everything since the run began: the reset, Besu startup,
-     peering and the health check, even if the validator was restarted in between.
+     peering and the health check, even if the pod was restarted in between.
    - Streaming matters because kubelet rotates container logs, and a single
      `kubectl logs` at the end would lose the start of a long, noisy run.
-   - A 3-second sleep lets the stream attach before anything else happens.
+   - A 3-second sleep lets the streams attach before anything else happens.
 3. **Warmup**: after a reset or a fix-up restart, the network is left idle for
    `warmupSeconds` (see [Warmup](#warmup)).
 4. **Start spamoor**: the manifest is piped to `kubectl apply -f -`, then the script waits
-   up to 10 minutes for the pod to be Ready. `loadStartUtc` is stamped once it's Ready.
-   Then every container's CPU/memory limits are read from the pod specs into
-   `meta.limits` (`<pod>/<container>` → `cpu`, `memory`) for the summary.
+   up to 10 minutes for the pod to be Ready. `loadStartUtc` is stamped once it's Ready,
+   and spamoor's log is streamed into `spamoor.log` from the container's start. At high
+   load spamoor can write 60 MB in 30 s (one warning per rejected tx), so a one-off
+   `kubectl logs` at the end only got the last rotated file. Then every container's
+   CPU/memory limits are read from the pod specs into `meta.limits`
+   (`<pod>/<container>` → `cpu`, `memory`) for the summary.
 5. **Sampling loop**:
    - Every `sampleSeconds` it appends `kubectl top pods --containers` to `top.log`, with
      a UTC timestamp at the start of each line.
    - It also checks spamoor's phase, and **stops early** if the pod is no longer
      `Running` (for example, if it crashed).
+   - **Early-failure retry**: if the pod has `Failed` or `Succeeded` within 60 s of
+     Ready, and it's the first attempt, its log is kept as `spamoor-failed-<n>.log`, the
+     pod is deleted and spamoor starts again with a fresh load window (`loadStartUtc`
+     restamped). Seen once: spamoor panicked preparing wallets after rpc-1 answered one
+     `eth_getBalance`-type call with `null`. `meta.spamoorFailures` records each failed
+     attempt and `meta.spamoorAttempts` the total.
    - The last sleep is cut short so the load phase ends on time.
-6. **Spamoor teardown**: spamoor's logs are saved *before* the pod is deleted, because
-   deleting it discards them. spamoor keeps sending during this, and through its
-   graceful shutdown, so `spamoorStoppedUtc` is stamped once the pod is gone.
-7. **Cooldown**: the validator stream keeps running for `cooldownSeconds` so the txpool
-   draining is captured.
+6. **Spamoor teardown**: the pod is deleted with a 5 s grace period straight away (its
+   log is already streamed). spamoor keeps sending until the pod is gone, so
+   `spamoorStoppedUtc` is stamped then, and `spamoorDeleteSeconds` records how long the
+   delete took. Over 60 s prints a warning and saves the pod's events as
+   `spamoor-events.log` (one delete took 13.5 minutes, with spamoor sending throughout).
+7. **Cooldown**: the validator and rpc streams keep running for `cooldownSeconds` so the
+   txpool draining is captured.
 
 ## Health check and fix-ups
 
@@ -248,7 +266,7 @@ prints a summary that fits on one screen, and saves it as `summary.txt` and in
   598,000 txs = 996.7 tx/s (requested 1,000 tx/s = 2000 per 2s slot); after first 2 min 1,000.1 tx/s
   Tx/block avg 1,993, max 2000
   Gas/block avg 41.9 Mgas, max 42.0 Mgas = 20.9 Mgas/s; 41.86% of the 100.0 Mgas limit avg, 42.00% max
-  Stopping spamoor (6 s after load end): 3 blocks, 6,000 txs
+  Stopping spamoor (6 s after load end; pod delete took 4 s): 3 blocks, 6,000 txs
   Drain after spamoor stopped: 27 blocks, 0 txs (txpool empty when spamoor stopped)
   Health: healthy after 33 s; fix-ups: none
   CPU cores max (avg) / limit, memory max / limit, during load (! = 95%+ of limit):
@@ -258,8 +276,12 @@ prints a summary that fits on one screen, and saves it as `summary.txt` and in
     spamoor      cpu  3.20 (2.50) / 40   mem  2.1Gi / 160.0Gi
   validator restarts 0 -> 0; validator.log WARN 3, ERROR 0
         3 x WARN RoundTimer | ...
-  spamoor.log error lines: 0
+  spamoor.log 1.2 MB: error lines 0, warning lines 0
 ```
+
+If spamoor was restarted or stopped early, extra lines say so, e.g.
+`spamoor attempt 1: Failed 31 s after start; restarted (log in spamoor-failed-1.log)` or
+`spamoor Failed after 0.2 of 10 min: load window cut short, run not comparable`.
 
 Where each figure comes from:
 
@@ -287,7 +309,11 @@ Where each figure comes from:
   risk.
 - **Warnings/errors**: counts of `WARN`/`ERROR` in `validator.log` (the whole run, not
   just the load), with the three most common messages (numbers and hashes blanked so
-  repeats group). `spamoor.log` lines containing "error".
+  repeats group). For `spamoor.log`: its size, the count of `level=error` (and `panic:`)
+  and `level=warning` lines, and the three most common of those messages. It's read in
+  one streaming pass because it can be over 1 GB.
+- **spamoor failures**: a retry, or a pod not `Running` at load end, adds a line and a
+  note. A load window cut short puts `SPAMOOR FAILED at <n> min` first in the notes.
 
 The end-of-batch table has one row per run: requested and achieved tx/s (also after the
 first 2 minutes), tx/block, Mgas/s, average gas used %, average block time, max gap, the
@@ -302,7 +328,8 @@ fails, the run is still packaged and the table row says why.
   - `logStreamDiedEarly` is set to true if the background kubectl had **already exited
     on its own**. That is the signal that the validator restarted, since the stream dies
     with the container.
-  - It then stops the stream, and deletes the spamoor pod if `$spamoorAlive` is still set.
+  - `rpcLogStreamDiedEarly` is the same for `rpc.log` (the RPC node restarted).
+  - It then stops the streams, and deletes the spamoor pod if `$spamoorAlive` is still set.
 - **Fallback logs**: if the stream died, it saves `--since-time=logStartUtc` logs from the
   current container as `validator-fallback.log`. If the restart count also changed, it
   saves `--previous` as `validator-previous.log`, which is usually where an OOMKill shows up.
@@ -332,9 +359,9 @@ the health check passes after the previous run's cooldown.
 1. **One failed status check ends the load phase early.** If the phase lookup fails once
    (an API blip), `Get-PodField` returns `$null`, which isn't `'Running'`, so the loop
    treats spamoor as stopped.
-2. **`spamoor.log` comes from a single `kubectl logs` call at the end.** If spamoor is very
-   verbose at high throughput, kubelet rotation could cut off the start of it. The
-   validator log doesn't have this problem because it's streamed.
+2. **`spamoor.log` can be huge.** When the network can't keep up, spamoor logs every
+   rejected tx (about 2 MB/s seen), so a 10-minute run can produce over 1 GB, and its zip
+   may go over `-MaxZipMB` and stay in `-WorkRoot`.
 3. **Run IDs use local time**, while every timestamp in `meta.json` is UTC. That's fine if
    the VDS clock is UTC; otherwise zip names and meta timestamps are offset from each other.
 4. **The private key is in the pod's args.** It never reaches git, but anyone who can read

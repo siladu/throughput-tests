@@ -58,13 +58,15 @@ Per run in `test-plan.json`:
    `admin_addPeer` every poll. If still unhealthy after `healthTimeoutSeconds`: a stalled
    chain gets a full reset, otherwise the worst pod is restarted (one at a time). After
    `maxFixups` of those, the run is abandoned.
-3. Stream the validator's logs with `kubectl logs -f --since-time=<logStartUtc>`, which
-   backfills the reset and health check. Streaming is used instead of a one-off
-   `kubectl logs` because kubelet log rotation would drop lines. Then wait
-   `warmupSeconds` if there was a reset or fix-up.
-4. Render the template and apply the spamoor pod; wait for Ready.
+3. Stream the validator's and the RPC node's logs with
+   `kubectl logs -f --since-time=<logStartUtc>`, which backfills the reset and health
+   check. Streaming is used instead of a one-off `kubectl logs` because kubelet log
+   rotation would drop lines. Then wait `warmupSeconds` if there was a reset or fix-up.
+4. Render the template and apply the spamoor pod; wait for Ready, then stream its log
+   too. If spamoor exits within 60 s, keep that log and start it once more.
 5. For `durationMinutes`, sample `kubectl top pods --containers` every `sampleSeconds`.
-6. Save spamoor's logs, delete its pod, keep logging for `cooldownSeconds` (txpool drain).
+6. Delete spamoor's pod (5 s grace; the delete is timed), keep logging for
+   `cooldownSeconds` (txpool drain).
 7. Stop the stream, print a screen-sized summary (blocks and txs read from the chain,
    tx/s achieved vs requested, gas per block / Mgas/s / % of gas limit, txs while spamoor
    was stopping vs drained after, CPU/memory against limits with 95%+ flagged, warnings),
@@ -84,7 +86,8 @@ Errors in one run are recorded in `meta.json` and the loop moves on.
 
 Top level: `image` (`name:tag` only, no registry), `namespace`, `validatorPod`, `rpcUrl`,
 `scenario` (spamoor subcommand), `slotDuration`, `resetNetwork`, `warmupSeconds`,
-`healthTimeoutSeconds`, `maxFixups`, `cooldownSeconds`, `sampleSeconds`, `runs`.
+`healthTimeoutSeconds`, `maxFixups`, `cooldownSeconds`, `sampleSeconds`, `runs`, and
+optional `rpcPod` (defaults to the first label of `rpcUrl`'s host).
 
 Each run: `name` (becomes part of the run ID and pod name, keep it short, lowercase,
 `[a-z0-9-]`), `durationMinutes` (expected 5-15), `throughput` (spamoor `-t`), `amount`
@@ -98,7 +101,12 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
 
 - `validator.log`: Besu logs from one validator, covering just that run, including the
   reset and health check.
-- `spamoor.log`: the load generator's own output.
+- `rpc.log`: Besu logs from the RPC node spamoor sends to, same window as `validator.log`.
+- `spamoor.log`: the load generator's own output, streamed from its start. Can exceed
+  1 GB when the network is overloaded (a warning per rejected tx).
+- `spamoor-failed-<n>.log`: a spamoor attempt that died in its first minute and was
+  retried (`meta.spamoorFailures`).
+- `spamoor-events.log`: only if deleting spamoor's pod took over 60 s.
 - `summary.txt`: the summary printed at the end of the run (also in `meta.json` as
   `summary`).
 - `top.log`: `<UTC timestamp> <pod> <container> <cpu> <memory>` samples for every pod.
@@ -107,7 +115,8 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
   `endUtc`; spamoor keeps sending between `loadEndUtc` and `spamoorStoppedUtc`, so the
   txpool drain starts at the latter), `health` (`secondsToHealthy`, `fixups`, final
   `peers`/`heads` per pod), `limits` (CPU/memory limit per `<pod>/<container>`), nodes used,
-  validator restart counts before/after, `logStreamDiedEarly`, `spamoorPhase`, `error`
+  validator restart counts before/after, `logStreamDiedEarly`, `rpcLogStreamDiedEarly`,
+  `spamoorPhase`, `spamoorAttempts`, `spamoorFailures`, `spamoorDeleteSeconds`, `error`
   if any.
 - `fixup-<n>-<pod>.log`: logs taken just before a fix-up (the restarted pod, or every pod
   for a full reset). Evidence for the startup peering problem (see Cluster context).
@@ -166,6 +175,12 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
   direction). If that splits the validators, QBFT stalls until the doubling round timers
   line up (10+ minutes). The runner works around it with `admin_addPeer`; re-check after
   upgrading before assuming it's still needed.
+- Besu config (as of 2026-10-19, `besu-node-<release>-besu-config` configmaps, config.toml):
+  `data-storage-format="FOREST"`, `sync-mode="FULL"`, `min-gas-price=0`, layered txpool
+  with no tx-pool options set (all defaults). Block gas limit is 2^53−1, so gas never
+  binds. Block selection is capped at 1500 ms (PoA default 75% of the 2 s period); the
+  2026-10-19 baselines topped out at ~1,500–1,650 tx/s with selection being interrupted.
+  The user changes this config between batches, so re-check before comparing.
 - From the VDS, `kubectl port-forward` takes about 5 s to start listening.
 - RPC endpoint inside the cluster:
   `http://besu-node-rpc-1-0.besu-node-rpc-1.besu-consensus.svc.cluster.local:8545`.
