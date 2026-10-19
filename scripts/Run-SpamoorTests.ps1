@@ -616,6 +616,8 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
             $msg = $l
             $i = $l.IndexOf('msg=')
             if ($i -ge 0) { $msg = $l.Substring($i + 4) }
+            # URLs (the RPC endpoint) would use up the width before the actual error
+            $msg = $msg -replace 'https?://[^\s"\\]+', '<url>'
             if ($msg.Length -gt 120) { $msg = $msg.Substring(0, 120) }
             $msg = $msg -replace '0x[0-9a-fA-F]+', '0x..' -replace '\d+', 'N'
             $msgCounts[$msg] = 1 + [int]$msgCounts[$msg]
