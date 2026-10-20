@@ -172,16 +172,21 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
   tolerate the taint, require `kubernetes.azure.com/agentpool In (besu)` (otherwise it
   lands in the separate `besu2` pool), and use the same anti-affinity so it gets the
   free node.
-- Besu 25.7.0 for now (an upgrade to the latest release is planned). Every pod has HTTP
+- Besu version changes between batches: 26.9.0 as of 2026-10-20, earlier batches on
+  25.7.0, and the user may switch back and forth or move to later releases. Don't assume
+  a version; the script must keep working with older log formats (e.g. 25.7.0 has no
+  `Timing(...)` in `Produced` lines), and runs on different versions aren't directly
+  comparable. Every pod has HTTP
   JSON-RPC on 8545 with the ADMIN API, and no readiness probe (Ready = container started).
   Peering comes from configmaps `besu-peers` (`static-nodes.json`: all 4 validators +
   rpc-1, by headless-service DNS name) and `besu-bootnodes` (validator-1, validator-2).
   The chart already sets `--Xdns-enabled=true --Xdns-update-enabled=true`.
-- Known issue, parked until the Besu upgrade: after a full restart some static-peer
-  links never form (on 2026-10-16, validator-4 never peered with validator-1/2 in either
-  direction). If that splits the validators, QBFT stalls until the doubling round timers
-  line up (10+ minutes). The runner works around it with `admin_addPeer`; re-check after
-  upgrading before assuming it's still needed.
+- Known issue (seen on 25.7.0): after a full restart some static-peer links never form
+  (on 2026-10-16, validator-4 never peered with validator-1/2 in either direction). If
+  that splits the validators, QBFT stalls until the doubling round timers line up (10+
+  minutes). The runner works around it with `admin_addPeer`. Keep the workaround and the
+  pre-run health check whatever the version: the user may revert Besu, and checking
+  health before every run keeps runs consistent.
 - Besu config (as of 2026-10-19, `besu-node-<release>-besu-config` configmaps, config.toml):
   `data-storage-format="FOREST"`, `sync-mode="FULL"`, `min-gas-price=0`, layered txpool
   with no tx-pool options set (all defaults). Block gas limit is 2^53−1, so gas never
