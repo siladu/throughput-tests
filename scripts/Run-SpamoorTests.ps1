@@ -412,6 +412,7 @@ function Get-BlocksSince([int]$Port, [long]$FromUnix) {
         $gas      = ConvertFrom-Hex $b.gasUsed
         $gasLimit = ConvertFrom-Hex $b.gasLimit
         $blocks.Add([pscustomobject]@{
+            Number   = $n
             Time     = $ts
             Txs      = @($b.transactions).Count
             Gas      = $gas
@@ -424,6 +425,116 @@ function Get-BlocksSince([int]$Port, [long]$FromUnix) {
     return , $blocks.ToArray()
 }
 
+# avg, p50, p95 and max of a set of numbers (nearest-rank percentiles)
+function Get-Spread([double[]]$Values) {
+    $s = [double[]]$Values.Clone()
+    [Array]::Sort($s)
+    $at = { param($p) $s[[int][Math]::Ceiling($p / 100 * $s.Count) - 1] }
+    [pscustomobject]@{ Avg = ($s | Measure-Object -Average).Average; P50 = & $at 50; P95 = & $at 95; Max = $s[-1] }
+}
+
+# Besu's per-block 'Produced #N ...' / 'Imported #N ...' lines, keyed by block number. All
+# versions log the txpool size ('N pending'); newer ones add the proposer's build time
+# ('gas in 2.378s') and 'Timing(..., txsSelection=551ms, ...)'. Phase names are read from
+# the line rather than fixed, so phases added or renamed in later releases still show up.
+function Read-BlockLogLines([string]$Path) {
+    $entries = @{}
+    $phases  = New-Object System.Collections.Generic.List[string]   # in first-seen order
+    foreach ($l in [IO.File]::ReadLines($Path)) {
+        if (-not $l.Contains(' pending')) { continue }
+        if ($l -cnotmatch '\b(Produced|Imported)\b[^#]*#(\d[\d,.]*)') { continue }
+        $kind = $Matches[1]
+        $num  = [long]($Matches[2] -replace '\D', '')
+        if ($kind -eq 'Imported' -and $entries[$num] -and $entries[$num].Kind -eq 'Produced') { continue }
+        $e = [pscustomobject]@{ Kind = $kind; Pending = $null; Total = $null; Phases = $null }
+        if ($l -match '\b(\d[\d,.]*) pending\b') { $e.Pending = [long]($Matches[1] -replace '\D', '') }
+        if ($kind -eq 'Produced') {
+            if ($l -match '\sin\s+([\d.]+\s*m?s)\b') { $e.Total = 1000 * (ConvertTo-Seconds $Matches[1]) }
+            if ($l -match 'Timing\(([^)]*)\)') {
+                $e.Phases = [ordered]@{}
+                foreach ($m in [regex]::Matches($Matches[1], '(\w+)=([\d.]+\s*m?s)\b')) {
+                    $name = $m.Groups[1].Value
+                    $e.Phases[$name] = 1000 * (ConvertTo-Seconds $m.Groups[2].Value)
+                    if (-not $phases.Contains($name)) { $phases.Add($name) }
+                }
+            }
+        }
+        $entries[$num] = $e
+    }
+    return @{ Entries = $entries; Phases = $phases.ToArray() }
+}
+
+# Build timings of the load blocks the logged validator proposed (about 1 in 4 with 4
+# validators), and its txpool size after each load block. Timings are from $SteadyFrom
+# (unix time) on if given, with the untrimmed figures alongside. Returns Lines and the
+# batch table's BuildMs (avg/p95) and OverSlot.
+function Get-BlockLogSummary($Load, $SteadyFrom, [string]$LogPath) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    $out   = @{ Lines = $lines; BuildMs = ''; OverSlot = '' }
+    $log   = Read-BlockLogLines $LogPath
+    $who   = Get-ShortName $validatorPod
+    $inLoad = @(foreach ($b in $Load) {
+        $e = $log.Entries[$b.Number]
+        if ($e) { [pscustomobject]@{ Time = $b.Time; E = $e } }
+    })
+    $produced = @($inLoad | Where-Object { $_.E.Kind -eq 'Produced' })
+    $timed    = @($produced | Where-Object { $null -ne $_.E.Total -or $_.E.Phases })
+    $head     = "Block production ($who proposed $($produced.Count) of $($Load.Count) load blocks)"
+    if ($produced.Count -eq 0) {
+        $lines.Add('Block production: no Produced lines for load blocks in validator.log')
+    } elseif ($timed.Count -eq 0) {
+        $lines.Add("$head; no build timings in its log (older Besu)")
+    } else {
+        $steady = $timed
+        $label  = "ms, whole load ($($timed.Count) blocks)"
+        if ($SteadyFrom) {
+            $s = @($timed | Where-Object { $_.Time -ge $SteadyFrom })
+            if ($s.Count -gt 0) { $steady = $s; $label = "ms, after first 2 min ($($s.Count) blocks)" }
+        }
+        $totals = @($steady | Where-Object { $null -ne $_.E.Total } | ForEach-Object { $_.E.Total })
+        $rows = @()
+        if ($totals.Count -gt 0) { $rows += , @('total', $totals) }
+        $zero = @()
+        foreach ($p in $log.Phases) {
+            $v = @($steady | Where-Object { $_.E.Phases -and $_.E.Phases.Contains($p) } | ForEach-Object { $_.E.Phases[$p] })
+            if ($v.Count -eq 0) { continue }
+            if (($v | Measure-Object -Maximum).Maximum -eq 0) { $zero += $p; continue }
+            $name = $p
+            if ($timingSubPhases -contains $p) { $name = "  $p" }
+            $rows += , @($name, $v)
+        }
+        $w = 2 + [Math]::Max($label.Length, [int]($rows | ForEach-Object { $_[0].Length } | Measure-Object -Maximum).Maximum)
+        $lines.Add("${head}:")
+        $lines.Add('  ' + $label.PadRight($w) + ('{0,7}{1,7}{2,7}{3,7}' -f 'avg', 'p50', 'p95', 'max'))
+        foreach ($r in $rows) {
+            $sp = Get-Spread $r[1]
+            $lines.Add('  ' + $r[0].PadRight($w) + ('{0,7:N0}{1,7:N0}{2,7:N0}{3,7:N0}' -f $sp.Avg, $sp.P50, $sp.P95, $sp.Max))
+        }
+        if ($zero.Count -gt 0) { $lines.Add('  0 ms throughout: ' + ($zero -join ', ')) }
+        if ($totals.Count -gt 0) {
+            $slotMs = 1000 * (ConvertTo-Seconds $plan.slotDuration)
+            $sp     = Get-Spread $totals
+            $over   = @($totals | Where-Object { $_ -gt $slotMs }).Count
+            $msg    = '  over {0} slot: {1} of {2} ({3:N0}%)' -f $plan.slotDuration, $over, $totals.Count, (100.0 * $over / $totals.Count)
+            $all    = @($timed | Where-Object { $null -ne $_.E.Total } | ForEach-Object { $_.E.Total })
+            if ($all.Count -ne $totals.Count) {
+                $spAll = Get-Spread $all
+                $msg += '; untrimmed total avg {0:N0}, p95 {1:N0}, over slot {2} of {3}' -f $spAll.Avg, $spAll.P95, @($all | Where-Object { $_ -gt $slotMs }).Count, $all.Count
+            }
+            $lines.Add($msg)
+            $out.BuildMs  = '{0:N0}/{1:N0}' -f $sp.Avg, $sp.P95
+            $out.OverSlot = '{0:N0}%' -f (100.0 * $over / $totals.Count)
+        }
+    }
+    $pend = @($inLoad | Where-Object { $null -ne $_.E.Pending })
+    if ($pend.Count -gt 0) {
+        $pm = $pend | ForEach-Object { $_.E.Pending } | Measure-Object -Average -Maximum
+        $lines.Add(('Txpool pending on {0} ({1} of {2} load blocks): avg {3:N0}, max {4:N0}, at load end {5:N0}' -f
+                $who, $pend.Count, $Load.Count, $pm.Average, $pm.Maximum, $pend[-1].E.Pending))
+    }
+    return $out
+}
+
 # Summarises a finished run from the chain (RPC on the logged validator), top.log and the
 # logs. Returns Lines (printed and saved as summary.txt) and Row (end-of-batch table).
 function Get-RunSummary($Run, $Meta, [string]$RunDir) {
@@ -432,7 +543,8 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     $extra  = @($Run.extraArgs | Where-Object { $_ }) -join ' '
     $row    = [ordered]@{
         Run = $Meta.name; 'Req tx/s' = [int]$reqTps; 'Tx/s' = ''; 'Tx/s 2m+' = ''; 'Tx/blk' = ''
-        'Max tx/blk' = ''; 'Mgas/s' = ''; 'Gas %' = ''; 'Blk s' = ''; 'Max gap' = ''; 'Besu CPU' = ''; 'Besu mem' = ''
+        'Max tx/blk' = ''; 'Mgas/s' = ''; 'Gas %' = ''; 'Blk s' = ''; 'Max gap' = ''; 'Build ms' = ''; 'Over slot' = ''
+        'Besu CPU' = ''; 'Besu mem' = ''
         'Extra args' = $extra; Notes = ''
     }
     $notes = @()
@@ -440,9 +552,11 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     $lines.Add("spamoor $($plan.scenario) --slot-duration $($plan.slotDuration) -t $($Run.throughput) --amount $($Run.amount) $extra".TrimEnd())
 
     # Blocks and transactions, from the chain
+    $valLog = Join-Path $RunDir 'validator.log'
     if ($Meta.loadStartUtc -and $Meta.loadEndUtc) {
         $ls = ConvertTo-Unix $Meta.loadStartUtc
         $le = ConvertTo-Unix $Meta.loadEndUtc
+        $load = @()
         try {
             $pf = Start-Forward $validatorPod $summaryPort
             try { $blocks = Get-BlocksSince $summaryPort $ls } finally { Stop-Process -Id $pf.Id -Force }
@@ -501,6 +615,19 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
         } catch {
             $lines.Add("Block stats unavailable: $_")
             $notes += 'no block stats'
+        }
+        # Build timings and txpool size, from validator.log
+        if ($load.Count -ge 2 -and (Test-Path $valLog)) {
+            try {
+                $steadyFrom = $null
+                if ($secs -gt 180) { $steadyFrom = $ls + 120 }
+                $bl = Get-BlockLogSummary $load $steadyFrom $valLog
+                foreach ($l in $bl.Lines) { $lines.Add($l) }
+                $row.'Build ms'  = $bl.BuildMs
+                $row.'Over slot' = $bl.OverSlot
+            } catch {
+                $lines.Add("Block production stats unavailable: $_")
+            }
         }
     } else {
         $lines.Add('No load phase (see error below).')
@@ -578,7 +705,6 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
         $restart += ' (RESTARTED MID-RUN)'
         $notes += 'validator restarted'
     }
-    $valLog = Join-Path $RunDir 'validator.log'
     if (Test-Path $valLog) {
         $hits = @(Select-String -Path $valLog -Pattern '\b(WARN|ERROR)\b' -CaseSensitive)
         $warn = @($hits | Where-Object { $_.Matches[0].Value -eq 'WARN' }).Count
@@ -702,6 +828,7 @@ $rpcLocalPortBase     = 18545
 $peersConfigMap       = 'besu-peers'
 $summaryPort          = $rpcLocalPortBase + 100
 $limitWarnPct         = 95   # summary flags any container at or above this % of its CPU/memory limit
+$timingSubPhases      = @('selectedTxsEvaluation')   # Besu Timing(...) phases that are part of the one before, so indented
 $spamoorRetrySeconds  = 60   # spamoor exiting this soon after Ready is retried (once) ...
 $spamoorMaxAttempts   = 2    # ... up to this many starts in total
 $spamoorGraceSeconds  = 5    # SIGTERM -> SIGKILL when stopping spamoor; it keeps sending until gone
@@ -959,8 +1086,8 @@ foreach ($run in $runs) {
     }
 }
 
-$batchTitle = "=== Batch summary: $($summaryRows.Count) run(s), load window only; 2m+ excludes the first 2 min ==="
-$batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
+$batchTitle = "=== Batch summary: $($summaryRows.Count) run(s), load window only; 2m+ excludes the first 2 min; Build ms (avg/p95) and Over slot: the logged validator's own blocks, 2m+ ==="
+$batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap', 'Build ms', 'Over slot', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
     Out-String -Width 300
 Write-Host "`n$batchTitle"
 Write-Host $batchTable

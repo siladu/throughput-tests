@@ -70,7 +70,9 @@ Per run in `test-plan.json`:
    `cooldownSeconds` (txpool drain).
 7. Stop the stream, print a screen-sized summary (blocks and txs read from the chain,
    tx/s achieved vs requested, gas per block / Mgas/s / % of gas limit, txs while spamoor
-   was stopping vs drained after, CPU/memory against limits with 95%+ flagged, warnings),
+   was stopping vs drained after, block build time per phase for the logged validator's
+   own blocks (newer Besu only), txpool size, CPU/memory against limits with 95%+
+   flagged, warnings),
    write `summary.txt` and `meta.json`,
    zip, copy into `runs/[<group>/]`, and with `-Push` commit and push that zip only.
 
@@ -143,8 +145,11 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
   then; if not, say so and use a longer cut for all runs being compared. Show the
   untrimmed figures alongside.
 - Compare runs on: block production rate and gaps, transactions per block, achieved vs
-  requested throughput, validator CPU/memory under load, restarts, and errors/warnings in
-  `validator.log`.
+  requested throughput, block build time (total and per phase) and blocks built over the
+  slot, txpool size, validator CPU/memory under load, restarts, and errors/warnings in
+  `validator.log`. Build timings only exist from Besu versions that log
+  `Produced ... Timing(...)` and cover only the logged validator's blocks (~1 in 4), so
+  don't compare them with runs on older Besu.
 - Check the requested load was actually generated (spamoor.log) before concluding the
   network was the bottleneck.
 - Present findings as a comparison across runs, and say which runs are not comparable

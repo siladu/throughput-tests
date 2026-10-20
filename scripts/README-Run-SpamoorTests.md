@@ -268,6 +268,16 @@ prints a summary that fits on one screen, and saves it as `summary.txt` and in
   Gas/block avg 41.9 Mgas, max 42.0 Mgas = 20.9 Mgas/s; 41.86% of the 100.0 Mgas limit avg, 42.00% max
   Stopping spamoor (6 s after load end; pod delete took 4 s): 3 blocks, 6,000 txs
   Drain after spamoor stopped: 27 blocks, 0 txs (txpool empty when spamoor stopped)
+  Block production (validator-1 proposed 75 of 300 load blocks):
+    ms, after first 2 min (60 blocks)      avg    p50    p95    max
+    total                                1,498  1,488  1,812  1,892
+    txsSelection                           578    576    684    696
+      selectedTxsEvaluation                264    264    264    264
+    blockAssembled                         120    120    120    120
+    blockImported                          800    800  1,100  1,100
+    0 ms throughout: duplicateWorldState, preTxsSelection
+    over 2s slot: 0 of 60 (0%); untrimmed total avg 1,648, p95 2,264, over slot 15 of 75
+  Txpool pending on validator-1 (300 of 300 load blocks): avg 34,950, max 49,900, at load end 49,900
   Health: healthy after 33 s; fix-ups: none
   CPU cores max (avg) / limit, memory max / limit, during load (! = 95%+ of limit):
     rpc-1        cpu  0.95 (0.70) / 40   mem  1.7Gi / 1.9Gi
@@ -302,6 +312,21 @@ Where each figure comes from:
   `loadEndUtc` → `spamoorStoppedUtc`, when spamoor was still sending. *Drain* is after
   that, so its txs (and "last txs at +N s") show the txpool emptying with no new load.
   Runs from before `spamoorStoppedUtc` existed count everything as drain.
+- **Block production**: from `validator.log`'s `Produced #N ...` lines, so only the load
+  blocks that validator proposed (about 1 in 4 with 4 validators). Lines are matched to
+  load blocks by block number, not log timestamp. Newer Besu logs the build time
+  (`gas in 2.378s`, the `total` row) and `Timing(...)` per phase. Every `name=<n>ms` in
+  `Timing(...)` becomes a row, so phases added or renamed in later releases show up
+  without a script change. Phases at 0 ms in every block are listed on one line.
+  `selectedTxsEvaluation` is part of `txsSelection` (`txsSelection + blockAssembled +
+  blockImported` = total), so it's indented; other phases like it go in
+  `$timingSubPhases`. *Over slot* counts blocks whose total exceeded `slotDuration` (taken
+  to be the Besu block period). Figures are after the first 2 minutes when the load is
+  over 3 minutes, with the untrimmed total alongside. Older Besu without timings gets a
+  single line saying so.
+- **Txpool pending**: the `N pending` in every `Produced`/`Imported` line (all Besu
+  versions), i.e. the logged validator's txpool size after each load block. A pool still
+  growing at load end means the load exceeds what the chain can take.
 - **CPU/memory**: `top.log` samples inside the load window, against the container limits
   in `meta.limits` (`-` if none). Memory limits are converted to Gi, so a decimal `2G`
   shows as `1.9Gi`. Any container whose max reaches 95% of a limit is marked `!` and
@@ -316,7 +341,9 @@ Where each figure comes from:
   note. A load window cut short puts `SPAMOOR FAILED at <n> min` first in the notes.
 
 The end-of-batch table has one row per run: requested and achieved tx/s (also after the
-first 2 minutes), average and max tx/block, Mgas/s, average gas used %, average block time, max gap, the
+first 2 minutes), average and max tx/block, Mgas/s, average gas used %, average block time, max gap,
+block build time avg/p95 in ms and the % of blocks built over the slot (the logged
+validator's own blocks after the first 2 minutes; empty for Besu without timings), the
 highest Besu CPU and memory (and which pod), the run's `extraArgs`, and notes such as
 errors, fix-ups, restarts and containers at 95%+ of a limit. If the summary itself
 fails, the run is still packaged and the table row says why. The table is also saved as
