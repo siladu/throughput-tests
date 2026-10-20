@@ -38,6 +38,7 @@ scripts/
 runs/
   <yyyyMMdd-HHmmss>-<name>.zip          # one zip per run, from the VDS
   <group>/<yyyyMMdd-HHmmss>-<name>.zip  # when the runner was given a group name
+  [<group>/]<yyyyMMdd-HHmmss>-batch-summary.txt  # end-of-batch comparison table
 ```
 
 ## The test loop (Run-SpamoorTests.ps1)
@@ -73,7 +74,8 @@ Per run in `test-plan.json`:
    write `summary.txt` and `meta.json`,
    zip, copy into `runs/[<group>/]`, and with `-Push` commit and push that zip only.
 
-After the last run it prints a table comparing every run in the batch. That table and
+After the last run it prints a table comparing every run in the batch and saves it as
+`runs/[<group>/]<yyyyMMdd-HHmmss>-batch-summary.txt` (batch start time). That table and
 the per-run summaries are normally what the user relays back for analysis.
 
 The run is built unzipped in `$HOME\spamoor-runs\[<group>\]<runId>\` on the VDS (outside

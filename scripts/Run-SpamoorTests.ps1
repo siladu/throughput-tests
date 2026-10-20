@@ -432,7 +432,7 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     $extra  = @($Run.extraArgs | Where-Object { $_ }) -join ' '
     $row    = [ordered]@{
         Run = $Meta.name; 'Req tx/s' = [int]$reqTps; 'Tx/s' = ''; 'Tx/s 2m+' = ''; 'Tx/blk' = ''
-        'Mgas/s' = ''; 'Gas %' = ''; 'Blk s' = ''; 'Max gap' = ''; 'Besu CPU' = ''; 'Besu mem' = ''
+        'Max tx/blk' = ''; 'Mgas/s' = ''; 'Gas %' = ''; 'Blk s' = ''; 'Max gap' = ''; 'Besu CPU' = ''; 'Besu mem' = ''
         'Extra args' = $extra; Notes = ''
     }
     $notes = @()
@@ -474,6 +474,7 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
                         (Format-Gas $gas.Average), (Format-Gas $gas.Maximum), $mgasPs, $gasPct.Average, (Format-Gas $load[-1].GasLimit), $gasPct.Maximum))
                 $row.'Tx/s'    = '{0:N0}' -f $tps
                 $row.'Tx/blk'  = '{0:N0}' -f ($txs.Sum / $load.Count)
+                $row.'Max tx/blk' = '{0:N0}' -f $txs.Maximum
                 $row.'Mgas/s'  = '{0:N1}' -f $mgasPs
                 $row.'Gas %'   = '{0:N2}' -f $gasPct.Average
                 $row.'Blk s'   = '{0:N2}' -f $avgBlk
@@ -759,6 +760,7 @@ Invoke-Native $kubectl @('delete', 'pod', 'spamoor', '-n', $ns, '--ignore-not-fo
 
 $runNumber   = 0
 $summaryRows = @()
+$batchStamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
 foreach ($run in $runs) {
     $runNumber++
     $safeName = ($run.name.ToLower() -replace '[^a-z0-9-]', '-')
@@ -957,8 +959,21 @@ foreach ($run in $runs) {
     }
 }
 
-Write-Host "`n=== Batch summary: $($summaryRows.Count) run(s), load window only; 2m+ excludes the first 2 min ==="
-$summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
-    Out-String -Width 300 | Write-Host
+$batchTitle = "=== Batch summary: $($summaryRows.Count) run(s), load window only; 2m+ excludes the first 2 min ==="
+$batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
+    Out-String -Width 300
+Write-Host "`n$batchTitle"
+Write-Host $batchTable
+
+# Saved next to the run zips (in the group folder if there is one); timestamped so a
+# reused group name doesn't overwrite an earlier batch's table
+$batchFile = Join-Path $runsDir "$batchStamp-batch-summary.txt"
+@($batchTitle, $batchTable.TrimEnd()) | Set-Content -Path $batchFile -Encoding UTF8
+Write-Host "Batch summary saved to $batchFile."
+if ($Push) {
+    $label = $batchStamp
+    if ($Group) { $label = "$Group/$batchStamp" }
+    Publish-Run $batchFile "spamoor batch summary $label"
+}
 
 Write-Host "All runs done. Local copies are in $workDir."

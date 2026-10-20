@@ -316,10 +316,12 @@ Where each figure comes from:
   note. A load window cut short puts `SPAMOOR FAILED at <n> min` first in the notes.
 
 The end-of-batch table has one row per run: requested and achieved tx/s (also after the
-first 2 minutes), tx/block, Mgas/s, average gas used %, average block time, max gap, the
+first 2 minutes), average and max tx/block, Mgas/s, average gas used %, average block time, max gap, the
 highest Besu CPU and memory (and which pod), the run's `extraArgs`, and notes such as
 errors, fix-ups, restarts and containers at 95%+ of a limit. If the summary itself
-fails, the run is still packaged and the table row says why.
+fails, the run is still packaged and the table row says why. The table is also saved as
+`runs\[<group>\]<yyyyMMdd-HHmmss>-batch-summary.txt` (the batch's start time, so a reused
+group doesn't overwrite an earlier batch's table), and committed and pushed with `-Push`.
 
 ## Cleanup and packaging
 
