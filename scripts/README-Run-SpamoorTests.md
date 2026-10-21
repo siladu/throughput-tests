@@ -150,8 +150,11 @@ Most of these exist to work around Windows PowerShell 5.1:
 
 ## Per-run setup
 
-- **Run ID**: a timestamp plus the cleaned run name. The pod name is `spamoor-<runId>`,
-  truncated to the 63-character Kubernetes limit.
+- **Run ID**: a timestamp plus the cleaned run name. The run name is `tps<N>`, where `N`
+  is the requested tx/s (`throughput / slotDuration`, so `-t 16000` with a 2 s slot is
+  `tps8000`); the plan's optional `name` is appended (`tps8000-<name>`) to tell apart
+  runs at the same rate. The pod name is `spamoor-<runId>`, truncated to the
+  63-character Kubernetes limit.
 - **spamoor args**: built from the plan's top-level fields plus the run's `throughput`,
   `amount` and `extraArgs`.
 - **Rendering**: each argument becomes a double-quoted YAML list item, and the four

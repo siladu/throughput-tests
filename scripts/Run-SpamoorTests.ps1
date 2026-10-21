@@ -892,7 +892,10 @@ $summaryRows = @()
 $batchStamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
 foreach ($run in $runs) {
     $runNumber++
-    $safeName = ($run.name.ToLower() -replace '[^a-z0-9-]', '-')
+    # Named after the requested tx/s (spamoor's -t is per slot); the plan's name, if any, is a suffix
+    $runName  = 'tps{0}' -f [math]::Round([double]$run.throughput / (ConvertTo-Seconds $plan.slotDuration))
+    if ($run.name) { $runName = "$runName-$($run.name)" }
+    $safeName = ($runName.ToLower() -replace '[^a-z0-9-]', '-')
     $runId    = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $safeName
     $podName  = "spamoor-$runId"
     if ($podName.Length -gt 63) { $podName = $podName.Substring(0, 63) }
@@ -914,7 +917,7 @@ foreach ($run in $runs) {
     $meta = [ordered]@{
         runId           = $runId
         group           = $Group
-        name            = $run.name
+        name            = $runName
         image           = $plan.image                                  # without the registry
         durationMinutes = $run.durationMinutes
         throughput      = $run.throughput
@@ -1068,7 +1071,7 @@ foreach ($run in $runs) {
         $summary.Lines | Set-Content -Path (Join-Path $runDir 'summary.txt') -Encoding UTF8
     } catch {
         Write-Warning "Couldn't summarise ${runId}: $_"
-        $summaryRows += [pscustomobject]@{ Run = $run.name; Notes = "summary failed: $_" }
+        $summaryRows += [pscustomobject]@{ Run = $runName; Notes = "summary failed: $_" }
     }
 
     $meta | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $runDir 'meta.json') -Encoding UTF8

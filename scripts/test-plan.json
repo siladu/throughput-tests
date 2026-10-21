@@ -12,9 +12,9 @@
   "cooldownSeconds": 60,
   "sampleSeconds": 30,
   "runs": [
-    { "name": "t2000", "durationMinutes": 10, "throughput": 2000, "amount": 50 },
-    { "name": "t4000", "durationMinutes": 10, "throughput": 4000, "amount": 50 },
-    { "name": "t16000", "durationMinutes": 10, "throughput": 16000, "amount": 50,
+    { "durationMinutes": 10, "throughput": 2000, "amount": 50 },
+    { "durationMinutes": 10, "throughput": 4000, "amount": 50 },
+    { "durationMinutes": 10, "throughput": 16000, "amount": 50,
       "extraArgs": ["--max-pending", "1000000", "--max-wallets", "4000"] }
   ]
 }

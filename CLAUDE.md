@@ -93,8 +93,10 @@ Top level: `image` (`name:tag` only, no registry), `namespace`, `validatorPod`, 
 `healthTimeoutSeconds`, `maxFixups`, `cooldownSeconds`, `sampleSeconds`, `runs`, and
 optional `rpcPod` (defaults to the first label of `rpcUrl`'s host).
 
-Each run: `name` (becomes part of the run ID and pod name, keep it short, lowercase,
-`[a-z0-9-]`), `durationMinutes` (expected 5-15), `throughput` (spamoor `-t`), `amount`
+Each run: optional `name` (the run is named `tps<throughput / slotDuration>`, e.g.
+`tps8000` for `-t 16000` on a 2 s slot; `name` is appended as `tps8000-<name>` to tell
+apart runs at the same rate; it becomes part of the run ID and pod name, keep it short,
+lowercase, `[a-z0-9-]`), `durationMinutes` (expected 5-15), `throughput` (spamoor `-t`), `amount`
 (spamoor `--amount`), optional `extraArgs` (array of extra spamoor CLI args).
 
 When editing the plan, tell the user the rough total wall time
