@@ -442,6 +442,7 @@ function Read-BlockLogLines([string]$Path) {
     $phases  = New-Object System.Collections.Generic.List[string]   # in first-seen order
     foreach ($l in [IO.File]::ReadLines($Path)) {
         if (-not $l.Contains(' pending')) { continue }
+        $l = $l -replace $ansiEscape, ''   # Besu colours its console log; 'ESC[32mProduced' has no \b
         if ($l -cnotmatch '\b(Produced|Imported)\b[^#]*#(\d[\d,.]*)') { continue }
         $kind = $Matches[1]
         $num  = [long]($Matches[2] -replace '\D', '')
@@ -706,8 +707,8 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
         $notes += 'validator restarted'
     }
     if (Test-Path $valLog) {
-        $hits = @(Select-String -Path $valLog -Pattern '\b(WARN|ERROR)\b' -CaseSensitive)
-        $warn = @($hits | Where-Object { $_.Matches[0].Value -eq 'WARN' }).Count
+        $hits = @(Select-String -Path $valLog -Pattern "(?:$ansiEscape|\b)(WARN|ERROR)\b" -CaseSensitive)
+        $warn = @($hits | Where-Object { $_.Matches[0].Groups[1].Value -eq 'WARN' }).Count
         $lines.Add("$restart; validator.log WARN $warn, ERROR $($hits.Count - $warn)")
         # Most common messages, with numbers and hashes blanked so repeats group together
         $common = $hits | ForEach-Object {
@@ -829,6 +830,7 @@ $peersConfigMap       = 'besu-peers'
 $summaryPort          = $rpcLocalPortBase + 100
 $limitWarnPct         = 95   # summary flags any container at or above this % of its CPU/memory limit
 $timingSubPhases      = @('selectedTxsEvaluation')   # Besu Timing(...) phases that are part of the one before, so indented
+$ansiEscape           = '\x1b\[[\d;]*[A-Za-z]'       # terminal colour codes in Besu's log
 $spamoorRetrySeconds  = 60   # spamoor exiting this soon after Ready is retried (once) ...
 $spamoorMaxAttempts   = 2    # ... up to this many starts in total
 $spamoorGraceSeconds  = 5    # SIGTERM -> SIGKILL when stopping spamoor; it keeps sending until gone
