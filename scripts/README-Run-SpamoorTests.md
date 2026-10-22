@@ -303,6 +303,13 @@ Where each figure comes from:
   stamped at or after `loadStartUtc`). The load window is `loadStartUtc`–`loadEndUtc`, by
   block timestamp. This reads one block per call, so it takes roughly half a minute for a
   10-minute run.
+- **Avg block time / max gap**: from the load blocks' timestamps. The average is the
+  span from first to last load block divided by the intervals between them. *Max gap*
+  is the longest interval between two consecutive load blocks, in whole seconds (block
+  timestamps have 1 s resolution). On a healthy network it equals the slot time
+  (`slotDuration`); a larger gap means at least one slot produced no block, usually a
+  QBFT round change (a proposer that was slow or missing). Gaps that grow with the
+  load point to block building or import not keeping up.
 - **Requested tx/s** is `throughput / slotDuration`, which assumes spamoor's `-t` is
   transactions per slot. If tx/block sits near `throughput` while blocks keep to the slot
   time, that assumption holds.
@@ -344,9 +351,12 @@ Where each figure comes from:
   note. A load window cut short puts `SPAMOOR FAILED at <n> min` first in the notes.
 
 The end-of-batch table has one row per run: requested and achieved tx/s (also after the
-first 2 minutes), average and max tx/block, Mgas/s, average gas used %, average block time, max gap,
+first 2 minutes), average and max tx/block, Mgas/s, average gas used %, average block time (`Blk s`), the longest gap between
+consecutive load blocks in seconds (`Max gap s`, see above),
 block build time avg/p95 in ms and the % of blocks built over the slot (the logged
 validator's own blocks after the first 2 minutes; empty for Besu without timings), the
+largest txpool pending count on the logged validator during the load (`Max pending`, the
+whole load window; a value close to the txpool's capacity means the pool filled up), the
 highest Besu CPU and memory (and which pod), the run's `extraArgs`, and notes such as
 errors, fix-ups, restarts and containers at 95%+ of a limit. If the summary itself
 fails, the run is still packaged and the table row says why. The table is also saved as

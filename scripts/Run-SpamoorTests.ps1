@@ -468,10 +468,10 @@ function Read-BlockLogLines([string]$Path) {
 # Build timings of the load blocks the logged validator proposed (about 1 in 4 with 4
 # validators), and its txpool size after each load block. Timings are from $SteadyFrom
 # (unix time) on if given, with the untrimmed figures alongside. Returns Lines and the
-# batch table's BuildMs (avg/p95) and OverSlot.
+# batch table's BuildMs (avg/p95), OverSlot and MaxPending.
 function Get-BlockLogSummary($Load, $SteadyFrom, [string]$LogPath) {
     $lines = New-Object System.Collections.Generic.List[string]
-    $out   = @{ Lines = $lines; BuildMs = ''; OverSlot = '' }
+    $out   = @{ Lines = $lines; BuildMs = ''; OverSlot = ''; MaxPending = '' }
     $log   = Read-BlockLogLines $LogPath
     $who   = Get-ShortName $validatorPod
     $inLoad = @(foreach ($b in $Load) {
@@ -532,6 +532,7 @@ function Get-BlockLogSummary($Load, $SteadyFrom, [string]$LogPath) {
         $pm = $pend | ForEach-Object { $_.E.Pending } | Measure-Object -Average -Maximum
         $lines.Add(('Txpool pending on {0} ({1} of {2} load blocks): avg {3:N0}, max {4:N0}, at load end {5:N0}' -f
                 $who, $pend.Count, $Load.Count, $pm.Average, $pm.Maximum, $pend[-1].E.Pending))
+        $out.MaxPending = '{0:N0}' -f $pm.Maximum
     }
     return $out
 }
@@ -544,7 +545,8 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     $extra  = @($Run.extraArgs | Where-Object { $_ }) -join ' '
     $row    = [ordered]@{
         Run = $Meta.name; 'Req tx/s' = [int]$reqTps; 'Tx/s' = ''; 'Tx/s 2m+' = ''; 'Tx/blk' = ''
-        'Max tx/blk' = ''; 'Mgas/s' = ''; 'Gas %' = ''; 'Blk s' = ''; 'Max gap' = ''; 'Build ms' = ''; 'Over slot' = ''
+        'Max tx/blk' = ''; 'Mgas/s' = ''; 'Gas %' = ''; 'Blk s' = ''; 'Max gap s' = ''; 'Build ms' = ''; 'Over slot' = ''
+        'Max pending' = ''
         'Besu CPU' = ''; 'Besu mem' = ''
         'Extra args' = $extra; Notes = ''
     }
@@ -593,7 +595,7 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
                 $row.'Mgas/s'  = '{0:N1}' -f $mgasPs
                 $row.'Gas %'   = '{0:N2}' -f $gasPct.Average
                 $row.'Blk s'   = '{0:N2}' -f $avgBlk
-                $row.'Max gap' = $maxGap
+                $row.'Max gap s' = $maxGap
             } else {
                 $lines.Add("Load: only $($load.Count) block(s) during the load window")
                 $notes += 'no blocks'
@@ -626,6 +628,7 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
                 foreach ($l in $bl.Lines) { $lines.Add($l) }
                 $row.'Build ms'  = $bl.BuildMs
                 $row.'Over slot' = $bl.OverSlot
+                $row.'Max pending' = $bl.MaxPending
             } catch {
                 $lines.Add("Block production stats unavailable: $_")
             }
@@ -1092,7 +1095,7 @@ foreach ($run in $runs) {
 }
 
 $batchTitle = "=== Batch summary: $($summaryRows.Count) run(s), load window only; 2m+ excludes the first 2 min; Build ms (avg/p95) and Over slot: the logged validator's own blocks, 2m+ ==="
-$batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap', 'Build ms', 'Over slot', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
+$batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap s', 'Build ms', 'Over slot', 'Max pending', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
     Out-String -Width 300
 Write-Host "`n$batchTitle"
 Write-Host $batchTable
