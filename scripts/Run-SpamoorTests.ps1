@@ -694,6 +694,78 @@ function Get-ValidatorSummary($Load, $SteadyFrom, $Meta, [string]$RunDir) {
     return $out
 }
 
+# spamoor's cap on transactions in flight (sent, not yet included): --max-pending, or
+# unset, eoatx's default (v1.2.x): 10 x -t, at most 10 x wallets (--max-wallets, else
+# 10 x -t up to 1,000, or -c / 50 within 10..1,000). Returns Cap and Source, or $null
+# when it can't be told (another scenario without --max-pending).
+function Get-SpamoorPendingCap($Run) {
+    $opt = @{}
+    $a = @($Run.extraArgs | Where-Object { $_ } | ForEach-Object { "$_" })
+    for ($i = 0; $i -lt $a.Count; $i++) {
+        if ($a[$i] -notmatch '^(--max-pending|--max-wallets|--count|-c)(?:=(\d+))?$') { continue }
+        $name = $Matches[1] -replace '^-c$', '--count'
+        $v = $Matches[2]
+        if (-not $v -and $i + 1 -lt $a.Count) { $v = $a[$i + 1] }
+        if ($v -match '^\d+$') { $opt[$name] = [long]$v }
+    }
+    if ($opt['--max-pending'] -gt 0) { return @{ Cap = $opt['--max-pending']; Source = '--max-pending' } }
+    if ($plan.scenario -ne 'eoatx') { return $null }
+    $t = [long]$Run.throughput
+    $wallets = $opt['--max-wallets']
+    if (-not $wallets) {
+        if ($opt['--count'] -gt 0) { $wallets = [Math]::Min(1000, [Math]::Max(10, [Math]::Floor($opt['--count'] / 50))) }
+        else { $wallets = [Math]::Min(1000, 10 * $t) }
+    }
+    $cap = 10 * $t
+    if ($cap -eq 0) { $cap = 4000 }
+    $cap = [Math]::Min($cap, 10 * $wallets)
+    if ($cap -le 0) { return $null }
+    return @{ Cap = $cap; Source = "eoatx default, $wallets wallets" }
+}
+
+# spamoor's own pending count at each load block, from its per-block line
+# ('block N: submitted=.., pending=.., confirmed=..'), against its cap. spamoor logs that
+# line after marking the block's txs confirmed, so pending is the low point; the cap
+# binds just before the block, at pending + confirmed ('in flight'). A block counts as at
+# the cap when that is $spamCapPct% of the cap or more. $Blocks: block number ->
+# Pending/InFlight. Returns Lines and the batch table's SpamPend and AtCap (after the
+# first 2 min when $SteadyFrom is set).
+function Get-SpamoorPendingSummary($Blocks, $Load, $SteadyFrom, $Run) {
+    $out  = @{ Lines = @(); SpamPend = ''; AtCap = '' }
+    $seen = @($Load | Where-Object { $Blocks.ContainsKey($_.Number) })
+    if ($seen.Count -eq 0) {
+        if ($Load.Count -gt 0) { $out.Lines += 'spamoor pending: no per-block lines (block N: ... pending=N) for load blocks in spamoor.log' }
+        return $out
+    }
+    $max  = ($seen | ForEach-Object { $Blocks[$_.Number].Pending } | Measure-Object -Maximum).Maximum
+    $peak = ($seen | ForEach-Object { $Blocks[$_.Number].InFlight } | Measure-Object -Maximum).Maximum
+    $out.SpamPend = '{0:N0}' -f $max
+    $cap = Get-SpamoorPendingCap $Run
+    $out.Lines += 'spamoor pending ({0} of {1} load blocks logged): max {2:N0}; in flight before the block (+ its confirmed) max {3:N0}' -f
+        $seen.Count, $Load.Count, $max, $peak
+    if (-not $cap) {
+        $out.Lines += '  cap unknown (no --max-pending, scenario not eoatx)'
+        return $out
+    }
+    $atCap = {
+        param($bs)
+        $n = @($bs | Where-Object { $Blocks[$_.Number].InFlight -ge $cap.Cap * $spamCapPct / 100 }).Count
+        100 * $n / $bs.Count
+    }
+    $whole = & $atCap $seen
+    $line  = '  cap {0:N0} ({1}); at cap ({2}%+ in flight): {3:N0}% of load blocks' -f $cap.Cap, $cap.Source, $spamCapPct, $whole
+    $out.AtCap = '{0:N0}%' -f $whole
+    $steady = @($seen | Where-Object { $SteadyFrom -and $_.Time -ge $SteadyFrom })
+    if ($steady.Count -gt 0) {
+        $s = & $atCap $steady
+        $line += ', after first 2 min {0:N0}%' -f $s
+        $out.AtCap = '{0:N0}%' -f $s
+    }
+    if ($peak -gt 1.05 * $cap.Cap) { $line += ' (in flight went over the cap: spamoor flags or version not as assumed)' }
+    $out.Lines += $line
+    return $out
+}
+
 # Summarises a finished run from the chain (RPC on $validatorPod), top.log and the logs.
 # Returns Lines (printed and saved as summary.txt), Detail (validators.txt) and Row
 # (end-of-batch table).
@@ -706,7 +778,7 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     $row    = [ordered]@{
         Run = $Meta.name; 'Req tx/s' = [int]$reqTps; 'Tx/s' = ''; 'Tx/s 2m+' = ''; 'Deliv %' = ''; 'Send err' = ''; 'Tx/blk' = ''
         'Max tx/blk' = ''; 'Mgas/s' = ''; 'Gas %' = ''; 'Blk s' = ''; 'Max gap s' = ''; 'Build ms' = ''; 'Over slot' = ''
-        'Max pending' = ''
+        'Max pending' = ''; 'Spam pend' = ''; 'At cap' = ''
         'Besu CPU' = ''; 'Besu mem' = ''
         'Extra args' = $extra; Notes = ''
     }
@@ -886,7 +958,15 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
         # most common warning/error messages counted (numbers and hex blanked)
         $spamErrors = 0; $spamWarns = 0; $sendErrors = 0
         $msgCounts  = @{}
+        $spamBlocks = @{}   # block number -> spamoor's pending after it, and in flight before it
         foreach ($l in [IO.File]::ReadLines($spamLog)) {
+            if ($l.Contains('pending=') -and $l -match '\bblock #?(\d+)\b.*?\bpending=(\d+)') {
+                $num  = [long]$Matches[1]
+                $pend = [long]$Matches[2]
+                $conf = 0
+                if ($l -match '\bconfirmed=(\d+)') { $conf = [long]$Matches[1] }
+                $spamBlocks[$num] = @{ Pending = $pend; InFlight = $pend + $conf }
+            }
             if ($l.Contains('level=error') -or $l.StartsWith('panic:')) { $spamErrors++ }
             elseif ($l.Contains('level=warning')) { $spamWarns++ }
             else { continue }
@@ -914,6 +994,10 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
         $msgCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 3 |
             ForEach-Object { $lines.Add(('  {0,7:N0} x {1}' -f $_.Value, $_.Key)) }
         if ($spamErrors -gt 0) { $notes += "spamoor errors $spamErrors" }
+        $sp = Get-SpamoorPendingSummary $spamBlocks $load $steadyFrom $Run
+        foreach ($l in $sp.Lines) { $lines.Add($l) }
+        $row.'Spam pend' = $sp.SpamPend
+        $row.'At cap'    = $sp.AtCap
     }
 
     if ($Meta.error) {
@@ -995,6 +1079,7 @@ $spamoorMaxAttempts   = 2    # ... up to this many starts in total
 $spamoorGraceSeconds  = 5    # SIGTERM -> SIGKILL when stopping spamoor; it keeps sending until gone
 $slowDeleteSeconds    = 60   # a spamoor pod delete slower than this is warned about, with its events saved
 $stallBlocks          = 5    # this many 0-tx load blocks in a row with a validator's pending count unchanged is a stall
+$spamCapPct           = 95   # a load block where spamoor's in-flight txs are at this % of its max-pending cap counts as at the cap
 # spamoor warning/error lines counted as send errors (one per tx the RPC node rejected).
 # Matches the verb rather than any one message, so reworded messages still count.
 $sendErrorPattern     = '(?i)\b(send|sending|submit|submitting|broadcast|broadcasting)\b|send\w*transaction'
@@ -1284,8 +1369,8 @@ $batchWhere = "runs\, started $batchStamp"
 if ($Group) { $batchWhere = "runs\$Group\, started $batchStamp" }
 $batchTitle = "=== Batch summary: $($summaryRows.Count) run(s) in $batchWhere ==="
 if ($batchLabel) { $batchTitle += "`nLabel: $batchLabel" }
-$batchTitle += "`nLoad window only; 2m+ excludes the first 2 min; Deliv %: Tx/s as % of Req tx/s (whole/2m+); Send err: spamoor's whole log; Build ms (avg/p95) and Over slot: every validator's blocks, 2m+"
-$batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Deliv %', 'Send err', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap s', 'Build ms', 'Over slot', 'Max pending', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
+$batchTitle += "`nLoad window only; 2m+ excludes the first 2 min; Deliv %: Tx/s as % of Req tx/s (whole/2m+); Send err: spamoor's whole log; Build ms (avg/p95) and Over slot: every validator's blocks, 2m+; Spam pend: spamoor's max pending=; At cap: % of blocks (2m+) with spamoor's in-flight txs at $spamCapPct%+ of its max-pending"
+$batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Deliv %', 'Send err', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap s', 'Build ms', 'Over slot', 'Max pending', 'Spam pend', 'At cap', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
     Out-String -Width 300
 Write-Host "`n$batchTitle"
 Write-Host $batchTable

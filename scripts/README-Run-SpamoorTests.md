@@ -307,6 +307,8 @@ prints a summary that fits on one screen, and saves it as `summary.txt` and in
     ...
     spamoor      cpu  3.20 (2.50) / 40   mem  2.1Gi / 160.0Gi
   spamoor.log 1.2 MB: error lines 0, warning lines 0; send errors 0 (0.0% of 610,000 requested)
+  spamoor pending (300 of 300 load blocks logged): max 2,010; in flight before the block (+ its confirmed) max 4,010
+    cap 10,000 (eoatx default, 1000 wallets); at cap (95%+ in flight): 0% of load blocks, after first 2 min 0%
 ```
 
 If spamoor was restarted or stopped early, extra lines say so, e.g.
@@ -388,6 +390,19 @@ Where each figure comes from:
   `spamoorStoppedUtc`), on screen and in the table's `Send err`. If spamoor's wording
   doesn't match, the count is 0 while the warning lines aren't: check the most common
   messages and adjust the pattern.
+- **spamoor pending**: spamoor logs `block N: submitted=.., pending=.., confirmed=..`
+  for every block; those lines are matched to load blocks by number. `pending` is how
+  many of its txs are sent but not yet included. spamoor stops sending when that reaches
+  its cap (`--max-pending`), so a run pinned at the cap is limited by spamoor, not the
+  network. spamoor logs the line just after counting the block's txs as confirmed, so
+  `pending` is the low point and reads about one block of txs under the cap even when
+  pinned; *in flight* (`pending + confirmed`) is the count just before the block, which
+  is what hits the cap. A block counts as *at cap* when in flight is 95%+ of the cap
+  (`$spamCapPct`). The cap is `--max-pending` from `extraArgs`; without it, eoatx's
+  default (spamoor v1.2.x) is worked out: 10 × `-t`, but at most 10 × wallets
+  (`--max-wallets`, else 10 × `-t` up to 1,000). Other scenarios without `--max-pending`
+  show `cap unknown`. If in flight goes over the cap, the line says the cap is probably
+  wrong (different spamoor version or flags).
 - **spamoor failures**: a retry, or a pod not `Running` at load end, adds a line and a
   note. A load window cut short puts `SPAMOOR FAILED at <n> min` first in the notes.
 
@@ -399,7 +414,9 @@ block build time avg/p95 in ms and the % of blocks built over the slot (every
 validator's blocks after the first 2 minutes; empty for Besu without timings), the
 largest txpool pending count on any validator during the load and which one
 (`Max pending`, the whole load window; a value close to the txpool's capacity means the
-pool filled up), the
+pool filled up), spamoor's largest `pending=` during the load (`Spam pend`) and the % of
+load blocks after the first 2 minutes where its in-flight txs were at its cap (`At cap`,
+see *spamoor pending*; near 100% means `--max-pending` limited the load), the
 highest Besu CPU and memory (and which pod), the run's `extraArgs`, and notes such as
 stalls, errors, fix-ups, restarts and containers at 95%+ of a limit. If the summary itself
 fails, the run is still packaged and the table row says why. Above the table, the title

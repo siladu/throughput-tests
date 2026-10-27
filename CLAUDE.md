@@ -75,7 +75,8 @@ Per run in `test-plan.json`:
    validator's own blocks (newer Besu only), one line per validator (blocks proposed,
    build time, txpool size, restarts, WARN/ERROR counts), STALL lines (5+ empty load
    blocks while a validator's pending count stays flat), CPU/memory against limits with
-   95%+ flagged, warnings, spamoor send errors),
+   95%+ flagged, warnings, spamoor send errors, spamoor's max pending and the % of
+   blocks where it sat at its max-pending cap),
    write `summary.txt`, `validators.txt` (per-validator detail) and `meta.json`,
    all into `runs/[<group>/]<runId>/`; with `-Zip`/`-Push` zip it next to the folder, and
    with `-Push` commit and push that zip only.
@@ -159,7 +160,8 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
   then; if not, say so and use a longer cut for all runs being compared. Show the
   untrimmed figures alongside.
 - Compare runs on: block production rate and gaps, transactions per block, achieved vs
-  requested throughput (`Deliv %`), stalls, spamoor send errors, block build time (total and per phase) and blocks built over the
+  requested throughput (`Deliv %`), stalls, spamoor send errors, spamoor at its pending cap
+  (`At cap`: near 100% means `--max-pending` limited the load, not the network), block build time (total and per phase) and blocks built over the
   slot, txpool size, validator CPU/memory under load, restarts, and errors/warnings in
   the validator logs. Build timings only exist from Besu versions that log
   `Produced ... Timing(...)`, so don't compare them with runs on older Besu. Runs before
