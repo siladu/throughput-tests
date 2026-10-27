@@ -777,7 +777,7 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     $extra  = @($Run.extraArgs | Where-Object { $_ }) -join ' '
     $row    = [ordered]@{
         Run = $Meta.name; 'Req tx/s' = [int]$reqTps; 'Tx/s' = ''; 'Tx/s 2m+' = ''; 'Deliv %' = ''; 'Send err' = ''; 'Tx/blk' = ''
-        'Max tx/blk' = ''; 'Mgas/s' = ''; 'Gas %' = ''; 'Blk s' = ''; 'Max gap s' = ''; 'Build ms' = ''; 'Over slot' = ''
+        'Max tx/blk' = ''; 'Mgas/s' = ''; 'Blk s' = ''; 'Max gap s' = ''; 'Build ms' = ''; 'Over slot' = ''
         'Max pending' = ''; 'Spam pend' = ''; 'At cap' = ''
         'Besu CPU' = ''; 'Besu mem' = ''
         'Extra args' = $extra; Notes = ''
@@ -829,7 +829,6 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
                 $row.'Tx/blk'  = '{0:N0}' -f ($txs.Sum / $load.Count)
                 $row.'Max tx/blk' = '{0:N0}' -f $txs.Maximum
                 $row.'Mgas/s'  = '{0:N1}' -f $mgasPs
-                $row.'Gas %'   = '{0:N2}' -f $gasPct.Average
                 $row.'Blk s'   = '{0:N2}' -f $avgBlk
                 $row.'Max gap s' = $maxGap
             } else {
@@ -1370,7 +1369,7 @@ if ($Group) { $batchWhere = "runs\$Group\, started $batchStamp" }
 $batchTitle = "=== Batch summary: $($summaryRows.Count) run(s) in $batchWhere ==="
 if ($batchLabel) { $batchTitle += "`nLabel: $batchLabel" }
 $batchTitle += "`nLoad window only; 2m+ excludes the first 2 min; Deliv %: Tx/s as % of Req tx/s (whole/2m+); Send err: spamoor's whole log; Build ms (avg/p95) and Over slot: every validator's blocks, 2m+; Spam pend: spamoor's max pending=; At cap: % of blocks (2m+) with spamoor's in-flight txs at $spamCapPct%+ of its max-pending"
-$batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Deliv %', 'Send err', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap s', 'Build ms', 'Over slot', 'Max pending', 'Spam pend', 'At cap', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
+$batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Deliv %', 'Send err', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Blk s', 'Max gap s', 'Build ms', 'Over slot', 'Max pending', 'Spam pend', 'At cap', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
     Out-String -Width 300
 Write-Host "`n$batchTitle"
 Write-Host $batchTable

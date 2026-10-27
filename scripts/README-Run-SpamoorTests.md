@@ -408,7 +408,7 @@ Where each figure comes from:
 
 The end-of-batch table has one row per run: requested and achieved tx/s (also after the
 first 2 minutes), achieved as a % of requested (`Deliv %`, whole window/after 2 minutes),
-spamoor send errors (`Send err`, count and % of requested), average and max tx/block, Mgas/s, average gas used %, average block time (`Blk s`), the longest gap between
+spamoor send errors (`Send err`, count and % of requested), average and max tx/block, Mgas/s, average block time (`Blk s`), the longest gap between
 consecutive load blocks in seconds (`Max gap s`, see above),
 block build time avg/p95 in ms and the % of blocks built over the slot (every
 validator's blocks after the first 2 minutes; empty for Besu without timings), the
