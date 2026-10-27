@@ -1,19 +1,24 @@
 # Run-SpamoorTests.ps1
 
 Runs every load test listed in `test-plan.json`, one after another. For each run it
-captures every validator's logs and CPU/memory samples, then zips the results into `runs/`
-and, with `-Push`, commits and pushes them. It runs on the VDS under Windows PowerShell 5.1.
+captures every validator's logs and CPU/memory samples into a folder per run under
+`runs/` (optionally zipped too; with `-Push`, the zip is committed and pushed). It runs on
+the VDS under Windows PowerShell 5.1.
 
 The VDS currently can't push to GitHub, so leave `-Push` off there; the console output
 (per-run summaries and the batch table) carries the results.
 
 ```powershell
 git pull
-.\scripts\Run-SpamoorTests.ps1                    # results go to runs\, not pushed
-.\scripts\Run-SpamoorTests.ps1 txpool-config      # results go to runs\txpool-config\
-.\scripts\Run-SpamoorTests.ps1 txpool-config -Push   # ... and commit + push each one
+.\scripts\Run-SpamoorTests.ps1                    # results go to runs\<runId>\
+.\scripts\Run-SpamoorTests.ps1 txpool-config      # results go to runs\txpool-config\<runId>\
+.\scripts\Run-SpamoorTests.ps1 txpool-config -Zip # ... plus runs\txpool-config\<runId>.zip
+.\scripts\Run-SpamoorTests.ps1 txpool-config -Push   # ... and commit + push each zip
 .\scripts\Run-SpamoorTests.ps1 -NoReset           # skip the network restart this batch
 ```
+
+The run folders are untracked files in the VDS's clone. `git pull` leaves them alone, but
+don't `git add` them: `spamoor.log` alone can exceed GitHub's 100 MB file limit.
 
 ## Overall shape
 
@@ -23,7 +28,7 @@ For each entry in `test-plan.json`:
 [reset network] → health check (+ fix-ups) → start validator + rpc log streams → [warmup]
 → start spamoor + its log stream [→ retry once if it dies in the first minute]
 → load + sample CPU/mem → delete spamoor → cooldown → stop streams → summary
-→ meta.json → zip → [git push]
+→ meta.json → [zip → [git push]]
 ```
 
 After the last run it prints a table comparing all runs in the batch. See
@@ -44,7 +49,7 @@ logStartUtc ──┬─ ... reset (if enabled), health check, fix-ups ...
               ├─ loadEndUtc    duration up; spamoor still sending while its pod is deleted
               ├─ spamoorStoppedUtc  spamoor pod gone (it has stopped sending)
               │   ... cooldown (txpool drains) ...
-              └─ endUtc        stream stopped, meta.json, zip, push
+              └─ endUtc        streams stopped, meta.json, [zip, push]
 ```
 
 ## Prerequisites on the VDS
@@ -74,16 +79,16 @@ All parameters have defaults.
 
 | Parameter | Default | Notes |
 |---|---|---|
-| *(first positional)* `-Group` | none | Subfolder of `runs\` (and of `-WorkRoot`) for this batch, e.g. `txpool-config`. Letters, digits, `.`, `_`, `-`. Without it, zips go straight into `runs\` |
+| *(first positional)* `-Group` | none | Subfolder of `runs\` for this batch, e.g. `txpool-config`. Letters, digits, `.`, `_`, `-`. Without it, run folders go straight into `runs\` |
 | `-PlanFile` | `scripts\test-plan.json` | |
 | `-TemplateFile` | `scripts\spamoor-run.template.yml` | |
 | `-RepoRoot` | parent of `scripts\` | |
-| `-WorkRoot` | `$HOME\spamoor-runs` | Working folder outside the repo. Each run is built here as an unzipped folder, zipped here, and only the zip is copied into `runs\`. So the unzipped copy of every run is already here (no need to unzip into `runs\`), and zips too big for git stay here |
 | `-PrivKeyFile` | `$HOME\spamoor-privkey.txt` | |
 | `-Registry` | `$env:IMAGE_REGISTRY` | Registry + path prefix, without the image name |
-| `-MaxZipMB` | `95` | GitHub rejects files over 100 MB |
+| `-MaxZipMB` | `95` | `-Push` skips zips larger than this: GitHub rejects files over 100 MB |
 | `-NoReset` | off | Skip the network restart even if the plan's `resetNetwork` is true. The health check still runs |
-| `-Push` | off | Commit and push each zip as it finishes. Without it, zips are copied into `runs\` and left uncommitted |
+| `-Zip` | off | Also zip each run folder, as `runs\[<group>\]<runId>.zip` next to the folder. Left uncommitted |
+| `-Push` | off | Zip (as `-Zip`), then commit and push each zip as it finishes |
 
 ## Plan settings for the health check
 
@@ -137,8 +142,9 @@ Most of these exist to work around Windows PowerShell 5.1:
 - **`Confirm-NetworkHealthy`**: the health check plus fix-ups (full reset or single-pod
   restart).
 - **`Publish-Run`** (only with `-Push`):
-  - It stages and commits **only the zip it was given**, so unzipped folders under
-    `runs\` or anything you've staged by hand stay out of the commit.
+  - It stages and commits **only the file it was given** (a run's zip, or the batch
+    summary), so the run folders under `runs\` or anything you've staged by hand stay out
+    of the commit.
   - It then tries `pull --rebase --autostash` + `push` up to 3 times with backoff, so
     pushes from the host while a batch is running don't break it.
   - If all attempts fail, the commit stays local and goes up with the next successful push.
@@ -394,9 +400,10 @@ group doesn't overwrite an earlier batch's table), and committed and pushed with
   `--since-time=logStartUtc` logs from the current container as
   `validator-<N>-fallback.log`. If that validator's restart count also changed, it saves
   `--previous` as `validator-<N>-previous.log`, which is usually where an OOMKill shows up.
-- **Packaging**: writes `meta.json` and zips the run folder. If the zip is at most
-  `-MaxZipMB`, it's copied into `runs\` (or `runs\<group>\`) and, with `-Push`, committed
-  and pushed. A larger zip stays only in `-WorkRoot`.
+- **Results**: the run is written straight into its folder, `runs\[<group>\]<runId>\`,
+  and `meta.json` is written last. With `-Zip` or `-Push` the folder is also zipped as
+  `<runId>.zip` next to it. With `-Push`, a zip of at most `-MaxZipMB` is committed and
+  pushed; a larger one is left uncommitted with a warning.
 
 ## Warmup
 
@@ -422,9 +429,9 @@ the health check passes after the previous run's cooldown.
    treats spamoor as stopped.
 2. **`spamoor.log` can be huge.** When the network can't keep up, spamoor logs every
    rejected tx (about 2 MB/s seen), so a 10-minute run can produce over 1 GB, and its zip
-   may go over `-MaxZipMB` and stay in `-WorkRoot`.
+   may go over `-MaxZipMB` and not be pushed.
 3. **Run IDs use local time**, while every timestamp in `meta.json` is UTC. That's fine if
-   the VDS clock is UTC; otherwise zip names and meta timestamps are offset from each other.
+   the VDS clock is UTC; otherwise folder names and meta timestamps are offset from each other.
 4. **The private key is in the pod's args.** It never reaches git, but anyone who can read
    pods in the namespace can see it (`kubectl get pod -o yaml`). A Kubernetes Secret
    would hide it.

@@ -2,37 +2,40 @@
 .SYNOPSIS
     Runs the spamoor load tests listed in test-plan.json. For each run it streams every
     validator's logs, samples pod CPU/memory, runs spamoor for the set duration, lets the
-    txpool drain, then zips everything into the repo's runs/ folder (and, with -Push,
-    commits and pushes it).
+    txpool drain, and leaves the results in a folder per run under the repo's runs/
+    folder (optionally zipped too; with -Push, the zip is committed and pushed).
 
 .EXAMPLE
     git pull
-    .\scripts\Run-SpamoorTests.ps1                   # results go to runs\, not pushed
+    .\scripts\Run-SpamoorTests.ps1                   # results go to runs\<runId>\, not zipped or pushed
 
 .EXAMPLE
-    .\scripts\Run-SpamoorTests.ps1 txpool-config     # results go to runs\txpool-config\
+    .\scripts\Run-SpamoorTests.ps1 txpool-config     # results go to runs\txpool-config\<runId>\
 
 .EXAMPLE
     .\scripts\Run-SpamoorTests.ps1 -NoReset          # don't restart the network, whatever the plan says
 
 .EXAMPLE
-    .\scripts\Run-SpamoorTests.ps1 -Push             # commit and push each result as it finishes
+    .\scripts\Run-SpamoorTests.ps1 -Zip              # also zip each run folder, as runs\<runId>.zip
+
+.EXAMPLE
+    .\scripts\Run-SpamoorTests.ps1 -Push             # zip, then commit and push each zip as it finishes
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    # Optional subfolder of runs\ (and of -WorkRoot) to group this batch's results under
+    # Optional subfolder of runs\ to group this batch's results under
     [Parameter(Position = 0)]
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]*$')]
     [string]$Group,
     [string]$PlanFile     = (Join-Path $PSScriptRoot 'test-plan.json'),
     [string]$TemplateFile = (Join-Path $PSScriptRoot 'spamoor-run.template.yml'),
     [string]$RepoRoot     = (Split-Path $PSScriptRoot -Parent),
-    [string]$WorkRoot     = (Join-Path $HOME 'spamoor-runs'),
     [string]$PrivKeyFile  = (Join-Path $HOME 'spamoor-privkey.txt'),   # kept outside the repo on purpose
     [string]$Registry     = $env:IMAGE_REGISTRY,                       # registry + path prefix, kept outside the repo
-    [int]$MaxZipMB        = 95,                                        # GitHub rejects files over 100 MB
+    [int]$MaxZipMB        = 95,                                        # -Push skips larger zips: GitHub rejects files over 100 MB
     [switch]$NoReset,                                                  # overrides the plan's resetNetwork
-    [switch]$Push                                                      # commit and push each run's zip
+    [switch]$Zip,                                                      # also zip each run folder
+    [switch]$Push                                                      # zip, then commit and push each run's zip
 )
 
 $ErrorActionPreference = 'Stop'
@@ -862,7 +865,7 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     return @{ Lines = $lines.ToArray(); Detail = $detail; Row = [pscustomobject]$row }
 }
 
-# Commits just the given zip (not anything else under runs\, such as unzipped copies)
+# Commits just the given file (not anything else under runs\, such as the run folders)
 # and pushes, along with any earlier commits whose push failed
 function Publish-Run([string]$ZipPath, [string]$Message) {
     Push-Location $RepoRoot
@@ -971,12 +974,8 @@ foreach ($p in $besuPods) {
 }
 
 $runsDir = Join-Path $RepoRoot 'runs'
-$workDir = $WorkRoot
-if ($Group) {
-    $runsDir = Join-Path $runsDir $Group
-    $workDir = Join-Path $WorkRoot $Group
-}
-New-Item -ItemType Directory -Force -Path $runsDir, $workDir | Out-Null
+if ($Group) { $runsDir = Join-Path $runsDir $Group }
+New-Item -ItemType Directory -Force -Path $runsDir | Out-Null
 
 $loadMinutes = ($runs | Measure-Object -Property durationMinutes -Sum).Sum
 Write-Host "$($runs.Count) runs, $loadMinutes min of load plus setup/cooldown per run."
@@ -1005,7 +1004,7 @@ foreach ($run in $runs) {
     $podName  = "spamoor-$runId"
     if ($podName.Length -gt 63) { $podName = $podName.Substring(0, 63) }
     $podName  = $podName.TrimEnd('-')
-    $runDir   = Join-Path $workDir $runId
+    $runDir   = Join-Path $runsDir $runId
     New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 
     Write-Host "`n=== Run $runNumber/$($runs.Count): $runId ($($run.durationMinutes) min) ==="
@@ -1196,18 +1195,19 @@ foreach ($run in $runs) {
 
     $meta | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $runDir 'meta.json') -Encoding UTF8
 
-    # 7. Package and publish
-    $zip = Join-Path $workDir "$runId.zip"
-    Compress-Archive -Path (Join-Path $runDir '*') -DestinationPath $zip -CompressionLevel Optimal -Force
-    $zipMB = [Math]::Round((Get-Item $zip).Length / 1MB, 1)
-    if ($zipMB -gt $MaxZipMB) {
-        Write-Warning "$runId.zip is $zipMB MB, too large for git. Left in $workDir."
-    } else {
-        Copy-Item $zip $runsDir
-        Write-Host "  Packaged $runId.zip ($zipMB MB)."
-        $label = $runId
-        if ($Group) { $label = "$Group/$runId" }
-        if ($Push) { Publish-Run (Join-Path $runsDir "$runId.zip") "spamoor run $label" }
+    # 7. The run folder is the result; zip it (next to the folder) and publish the zip if asked
+    Write-Host "  Results in $runDir."
+    if ($Zip -or $Push) {
+        $zipPath = Join-Path $runsDir "$runId.zip"
+        Compress-Archive -Path (Join-Path $runDir '*') -DestinationPath $zipPath -CompressionLevel Optimal -Force
+        $zipMB = [Math]::Round((Get-Item $zipPath).Length / 1MB, 1)
+        Write-Host "  Zipped $runId.zip ($zipMB MB)."
+        if ($Push) {
+            $label = $runId
+            if ($Group) { $label = "$Group/$runId" }
+            if ($zipMB -gt $MaxZipMB) { Write-Warning "$runId.zip is $zipMB MB, too large for git; not pushed." }
+            else { Publish-Run $zipPath "spamoor run $label" }
+        }
     }
 }
 
@@ -1217,7 +1217,7 @@ $batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', '
 Write-Host "`n$batchTitle"
 Write-Host $batchTable
 
-# Saved next to the run zips (in the group folder if there is one); timestamped so a
+# Saved next to the run folders (in the group folder if there is one); timestamped so a
 # reused group name doesn't overwrite an earlier batch's table
 $batchFile = Join-Path $runsDir "$batchStamp-batch-summary.txt"
 @($batchTitle, $batchTable.TrimEnd()) | Set-Content -Path $batchFile -Encoding UTF8
@@ -1228,4 +1228,4 @@ if ($Push) {
     Publish-Run $batchFile "spamoor batch summary $label"
 }
 
-Write-Host "All runs done. Local copies are in $workDir."
+Write-Host "All runs done. Results are in $runsDir."

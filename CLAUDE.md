@@ -14,7 +14,7 @@ There are two machines. Git carries scripts **one way only**, host → VDS:
 | VDS (Windows, PowerShell) | The user only | Yes (kubectl) | `git pull`, run tests |
 
 - **The VDS can't push to GitHub.** Results, logs and command output come back only as
-  console output the user relays, so run zips won't normally appear in `runs/` on the host.
+  console output the user relays, so run results won't normally appear in `runs/` on the host.
   When asking for data, ask for something that fits on a screen (counts, summaries,
   `Select-String` filtered log lines), not whole files.
 - You cannot run kubectl, PowerShell scripts or tests yourself. Nothing in `scripts/` is
@@ -31,22 +31,23 @@ There are two machines. Git carries scripts **one way only**, host → VDS:
 
 ```
 scripts/
-  Run-SpamoorTests.ps1        # test loop: run load, capture logs, zip, push
+  Run-SpamoorTests.ps1        # test loop: run load, capture logs, [zip, push]
   README-Run-SpamoorTests.md  # walkthrough of the runner; keep in sync when changing it
   spamoor-run.template.yml    # spamoor pod manifest, rendered per run
   test-plan.json              # which runs to do, and settings
 runs/
-  <yyyyMMdd-HHmmss>-<name>.zip          # one zip per run, from the VDS
-  <group>/<yyyyMMdd-HHmmss>-<name>.zip  # when the runner was given a group name
+  [<group>/]<yyyyMMdd-HHmmss>-<name>/      # one folder per run, on the VDS (group if given)
+  [<group>/]<yyyyMMdd-HHmmss>-<name>.zip   # only with -Zip or -Push
   [<group>/]<yyyyMMdd-HHmmss>-batch-summary.txt  # end-of-batch comparison table
 ```
 
 ## The test loop (Run-SpamoorTests.ps1)
 
-Invocation: `.\scripts\Run-SpamoorTests.ps1 [<group>] [-NoReset] [-Push]`. `<group>` is
-an optional subfolder of `runs/`. `-NoReset` overrides the plan's `resetNetwork`.
-Pushing is **off by default**: without `-Push` the zips land in `runs/` uncommitted.
-`-Push` won't work from the VDS while it can't push.
+Invocation: `.\scripts\Run-SpamoorTests.ps1 [<group>] [-NoReset] [-Zip] [-Push]`.
+`<group>` is an optional subfolder of `runs/`. `-NoReset` overrides the plan's
+`resetNetwork`. Each run's results are a folder in `runs/[<group>/]`, untracked in git.
+Zipping is **off by default**: `-Zip` also zips each folder next to it; `-Push` zips and
+commits and pushes the zip. `-Push` won't work from the VDS while it can't push.
 
 Per run in `test-plan.json`:
 
@@ -75,15 +76,15 @@ Per run in `test-plan.json`:
    build time, txpool size, restarts, WARN/ERROR counts), CPU/memory against limits with
    95%+ flagged, warnings),
    write `summary.txt`, `validators.txt` (per-validator detail) and `meta.json`,
-   zip, copy into `runs/[<group>/]`, and with `-Push` commit and push that zip only.
+   all into `runs/[<group>/]<runId>/`; with `-Zip`/`-Push` zip it next to the folder, and
+   with `-Push` commit and push that zip only.
 
 After the last run it prints a table comparing every run in the batch and saves it as
 `runs/[<group>/]<yyyyMMdd-HHmmss>-batch-summary.txt` (batch start time). That table and
 the per-run summaries are normally what the user relays back for analysis.
 
-The run is built unzipped in `$HOME\spamoor-runs\[<group>\]<runId>\` on the VDS (outside
-the repo) and zipped there; only the zip goes into `runs/`. Point the user there rather
-than unzipping into `runs/`.
+Runs before 2026-10-27 were built in `$HOME\spamoor-runs\[<group>\]<runId>\` on the VDS
+and only a zip went into `runs/`; later runs are folders in `runs/[<group>/]<runId>\`.
 
 Errors in one run are recorded in `meta.json` and the loop moves on.
 
@@ -106,7 +107,7 @@ When editing the plan, tell the user the rough total wall time
 (sum of durations + per-run warmup/cooldown + a few minutes per network restart and health
 check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are needed).
 
-### Run zip contents
+### Run folder contents
 
 - `validator-<N>.log`: Besu logs from each validator, covering just that run, including
   the reset and health check. Runs before 2026-10-27 have a single `validator.log`
@@ -142,8 +143,8 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
 ## Analysing results
 
 - Usually the input is the console output of the per-run summaries and the batch table,
-  not the zips. Work from those; if a question needs more, give the user a PowerShell block
-  that pulls just that out of `$HOME\spamoor-runs\<group>\<runId>\` on the VDS.
+  not the run folders. Work from those; if a question needs more, give the user a PowerShell block
+  that pulls just that out of `runs\<group>\<runId>\` on the VDS.
 - If you do have zips, unzip them into a scratch location outside the repo (or a
   gitignored folder), never into `runs/`.
 - Use `meta.json` timestamps to separate warmup, load and cooldown phases in the logs.
@@ -227,7 +228,7 @@ Target **Windows PowerShell 5.1** unless told otherwise:
 
 Keep the same shape so results stay comparable: a `Run-<Tool>Tests.ps1` (or a `tool`
 field in the plan if refactoring to one runner), a `<tool>-run.template.yml`, its own
-plan file, and the same zip contents (`validator-<N>.log`, `top.log`, `meta.json`, plus the
+plan file, and the same run folder contents (`validator-<N>.log`, `top.log`, `meta.json`, plus the
 tool's own log). Shared helpers can move to a `scripts/common.ps1` dot-sourced by each
 runner once there's a second tool, not before.
 
@@ -239,5 +240,6 @@ runner once there's a second tool, not before.
 - Never commit the internal image registry or anything naming the organisation. The
   registry + path prefix comes from `$env:IMAGE_REGISTRY` on the VDS and is prepended to
   the plan's `image` at render time; `meta.json` records only `image`.
-- GitHub rejects files over 100 MB; the runner keeps zips over 95 MB local. Run zips stay
+- GitHub rejects files over 100 MB; `-Push` skips zips over 95 MB. Never commit run
+  folders (`spamoor.log` alone can be 1 GB+). Run zips stay
   in history forever, so suggest a fresh repo/branch after large batches.
