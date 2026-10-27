@@ -588,6 +588,7 @@ function Get-ValidatorSummary($Load, $SteadyFrom, $Meta, [string]$RunDir) {
     }
     $lines.Add('Per validator (more in validators.txt; prop = load blocks proposed, build = ms avg/p95, pend = txpool max/at load end):')
     $maxPend = $null
+    $stalls  = @()   # From/To index into $Load, Pod, Pending
     foreach ($pod in $Meta.validatorPods) {
         $short = Get-ShortName $pod
         $detail.Add("--- $short ---")
@@ -626,6 +627,25 @@ function Get-ValidatorSummary($Load, $SteadyFrom, $Meta, [string]$RunDir) {
                         $pend.Count, $Load.Count, $pm.Average, $pm.Maximum, $pend[-1]))
                 if (-not $maxPend -or $pm.Maximum -gt $maxPend.Value) { $maxPend = @{ Value = $pm.Maximum; Pod = $short } }
             }
+            # Stalls: $stallBlocks+ consecutive load blocks with 0 txs while this validator's
+            # pending count stays the same (and above 0): txs waiting that no proposer includes
+            $from = -1
+            $flat = $null
+            for ($i = 0; $i -le $Load.Count; $i++) {
+                $p = $null
+                if ($i -lt $Load.Count -and $Load[$i].Txs -eq 0) {
+                    $e = $log.Entries[$Load[$i].Number]
+                    if ($e -and $e.Pending -gt 0) { $p = $e.Pending }
+                }
+                if ($from -ge 0 -and $p -eq $flat) { continue }
+                if ($from -ge 0 -and $i - $from -ge $stallBlocks) {
+                    $stalls += [pscustomobject]@{ From = $from; To = $i - 1; Pod = $short; Pending = $flat }
+                    $detail.Add(('STALL: blocks #{0}-#{1} ({2} blocks) had 0 txs while pending stayed at {3:N0}' -f
+                            $Load[$from].Number, $Load[$i - 1].Number, ($i - $from), $flat))
+                }
+                $from = -1
+                if ($null -ne $p) { $from = $i; $flat = $p }
+            }
         }
         $parts += $rs
         $parts += "WARN $($log.Warn) ERROR $($log.Error)"
@@ -635,6 +655,31 @@ function Get-ValidatorSummary($Load, $SteadyFrom, $Meta, [string]$RunDir) {
             ForEach-Object { $detail.Add(('  {0,5} x {1}' -f $_.Value, $_.Key)) }
     }
     if ($maxPend) { $out.MaxPending = '{0:N0} {1}' -f $maxPend.Value, $maxPend.Pod }
+
+    # The same stall usually shows on several validators: merge overlapping block ranges
+    $merged = @()
+    foreach ($st in ($stalls | Sort-Object From)) {
+        $m = $merged | Select-Object -Last 1
+        $who = '{0} {1:N0}' -f $st.Pod, $st.Pending
+        if ($m -and $st.From -le $m.To) {
+            $m.To = [Math]::Max($m.To, $st.To)
+            $m.Pods += $who
+        } else {
+            $merged += [pscustomobject]@{ From = $st.From; To = $st.To; Pods = @($who) }
+        }
+    }
+    if ($merged.Count -gt 0) {
+        $ls = ConvertTo-Unix $Meta.loadStartUtc
+        foreach ($m in ($merged | Select-Object -First 3)) {
+            $a = $Load[$m.From]
+            $z = $Load[$m.To]
+            $lines.Add(('STALL +{0} s into load: #{1}-#{2} ({3} blocks, {4} s) 0 txs, pending flat: {5}' -f
+                    ($a.Time - $ls), $a.Number, $z.Number, ($m.To - $m.From + 1), ($z.Time - $a.Time), ($m.Pods -join ', ')))
+        }
+        if ($merged.Count -gt 3) { $lines.Add("  ... $($merged.Count - 3) more (validators.txt lists them per validator)") }
+        $blocks = ($merged | ForEach-Object { $_.To - $_.From + 1 } | Measure-Object -Sum).Sum
+        $out.Notes = @("STALL x$($merged.Count) ($blocks blocks)") + $out.Notes
+    }
 
     # Most common WARN/ERROR messages across every validator's log
     $all = @{}
@@ -659,7 +704,7 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     $reqTps = [double]$Run.throughput / (ConvertTo-Seconds $plan.slotDuration)
     $extra  = @($Run.extraArgs | Where-Object { $_ }) -join ' '
     $row    = [ordered]@{
-        Run = $Meta.name; 'Req tx/s' = [int]$reqTps; 'Tx/s' = ''; 'Tx/s 2m+' = ''; 'Tx/blk' = ''
+        Run = $Meta.name; 'Req tx/s' = [int]$reqTps; 'Tx/s' = ''; 'Tx/s 2m+' = ''; 'Deliv %' = ''; 'Send err' = ''; 'Tx/blk' = ''
         'Max tx/blk' = ''; 'Mgas/s' = ''; 'Gas %' = ''; 'Blk s' = ''; 'Max gap s' = ''; 'Build ms' = ''; 'Over slot' = ''
         'Max pending' = ''
         'Besu CPU' = ''; 'Besu mem' = ''
@@ -692,13 +737,17 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
                 for ($i = 1; $i -lt $load.Count; $i++) { $maxGap = [Math]::Max($maxGap, $load[$i].Time - $load[$i - 1].Time) }
                 $avgBlk = $span / ($load.Count - 1)
                 $lines.Add(('Load {0:N1} min: {1} blocks, avg {2:N2} s, max gap {3} s' -f ($secs / 60), $load.Count, $avgBlk, $maxGap))
-                $tpsLine = '{0:N0} txs = {1:N1} tx/s (requested {2:N0} tx/s = {3} per {4} slot)' -f $txs.Sum, $tps, $reqTps, $Run.throughput, $plan.slotDuration
+                # Delivered = included on chain, as a % of the requested rate
+                $tpsLine = '{0:N0} txs = {1:N1} tx/s = {2:N1}% of requested {3:N0} tx/s ({4} per {5} slot)' -f
+                    $txs.Sum, $tps, (100 * $tps / $reqTps), $reqTps, $Run.throughput, $plan.slotDuration
+                $row.'Deliv %' = '{0:N1}' -f (100 * $tps / $reqTps)
                 # Same 2-minute cut as the analysis rule in CLAUDE.md (spamoor ramp, JIT warmup)
                 if ($secs -gt 180) {
                     $steadyTxs = ($load | Where-Object { $_.Time -ge $ls + 120 } | Measure-Object -Property Txs -Sum).Sum
                     $tps2 = $steadyTxs / ($secs - 120)
-                    $tpsLine += '; after first 2 min {0:N1} tx/s' -f $tps2
+                    $tpsLine += '; after first 2 min {0:N1} tx/s = {1:N1}%' -f $tps2, (100 * $tps2 / $reqTps)
                     $row.'Tx/s 2m+' = '{0:N0}' -f $tps2
+                    $row.'Deliv %' += '/{0:N1}' -f (100 * $tps2 / $reqTps)
                 }
                 $lines.Add($tpsLine)
                 $lines.Add(('Tx/block avg {0:N0}, max {1}' -f ($txs.Sum / $load.Count), $txs.Maximum))
@@ -835,12 +884,13 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     if (Test-Path $spamLog) {
         # Can be 1 GB+ when the network is overloaded, so one streaming pass, with the
         # most common warning/error messages counted (numbers and hex blanked)
-        $spamErrors = 0; $spamWarns = 0
+        $spamErrors = 0; $spamWarns = 0; $sendErrors = 0
         $msgCounts  = @{}
         foreach ($l in [IO.File]::ReadLines($spamLog)) {
             if ($l.Contains('level=error') -or $l.StartsWith('panic:')) { $spamErrors++ }
             elseif ($l.Contains('level=warning')) { $spamWarns++ }
             else { continue }
+            if ($l -match $sendErrorPattern) { $sendErrors++ }
             $msg = $l
             $i = $l.IndexOf('msg=')
             if ($i -ge 0) { $msg = $l.Substring($i + 4) }
@@ -851,7 +901,16 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
             $msgCounts[$msg] = 1 + [int]$msgCounts[$msg]
         }
         $mb = (Get-Item $spamLog).Length / 1MB
-        $lines.Add(('spamoor.log {0:N1} MB: error lines {1}, warning lines {2:N0}' -f $mb, $spamErrors, $spamWarns))
+        # Against the txs requested over the time spamoor was sending (load start to its pod gone)
+        $sendMsg = '{0:N0}' -f $sendErrors
+        $sentTo  = $Meta.spamoorStoppedUtc
+        if (-not $sentTo) { $sentTo = $Meta.loadEndUtc }
+        if ($Meta.loadStartUtc -and $sentTo) {
+            $reqTxs = $reqTps * ((ConvertTo-Unix $sentTo) - (ConvertTo-Unix $Meta.loadStartUtc))
+            if ($reqTxs -gt 0) { $sendMsg += ' ({0:N1}% of {1:N0} requested)' -f (100 * $sendErrors / $reqTxs), $reqTxs }
+        }
+        $lines.Add(('spamoor.log {0:N1} MB: error lines {1}, warning lines {2:N0}; send errors {3}' -f $mb, $spamErrors, $spamWarns, $sendMsg))
+        $row.'Send err' = $sendMsg -replace ' of [\d,.]+ requested', ''
         $msgCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 3 |
             ForEach-Object { $lines.Add(('  {0,7:N0} x {1}' -f $_.Value, $_.Key)) }
         if ($spamErrors -gt 0) { $notes += "spamoor errors $spamErrors" }
@@ -935,6 +994,10 @@ $spamoorRetrySeconds  = 60   # spamoor exiting this soon after Ready is retried 
 $spamoorMaxAttempts   = 2    # ... up to this many starts in total
 $spamoorGraceSeconds  = 5    # SIGTERM -> SIGKILL when stopping spamoor; it keeps sending until gone
 $slowDeleteSeconds    = 60   # a spamoor pod delete slower than this is warned about, with its events saved
+$stallBlocks          = 5    # this many 0-tx load blocks in a row with a validator's pending count unchanged is a stall
+# spamoor warning/error lines counted as send errors (one per tx the RPC node rejected).
+# Matches the verb rather than any one message, so reworded messages still count.
+$sendErrorPattern     = '(?i)\b(send|sending|submit|submitting|broadcast|broadcasting)\b|send\w*transaction'
 
 # The RPC node spamoor sends to (first label of rpcUrl's host), unless the plan names one
 $rpcPod = $plan.rpcPod
@@ -1221,8 +1284,8 @@ $batchWhere = "runs\, started $batchStamp"
 if ($Group) { $batchWhere = "runs\$Group\, started $batchStamp" }
 $batchTitle = "=== Batch summary: $($summaryRows.Count) run(s) in $batchWhere ==="
 if ($batchLabel) { $batchTitle += "`nLabel: $batchLabel" }
-$batchTitle += "`nLoad window only; 2m+ excludes the first 2 min; Build ms (avg/p95) and Over slot: every validator's blocks, 2m+"
-$batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap s', 'Build ms', 'Over slot', 'Max pending', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
+$batchTitle += "`nLoad window only; 2m+ excludes the first 2 min; Deliv %: Tx/s as % of Req tx/s (whole/2m+); Send err: spamoor's whole log; Build ms (avg/p95) and Over slot: every validator's blocks, 2m+"
+$batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Deliv %', 'Send err', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap s', 'Build ms', 'Over slot', 'Max pending', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
     Out-String -Width 300
 Write-Host "`n$batchTitle"
 Write-Host $batchTable

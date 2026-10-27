@@ -278,7 +278,7 @@ prints a summary that fits on one screen, and saves it as `summary.txt` and in
   --- Summary: 20261016-140623-tps1000 (Besu 26.9.0, txpool defaults) ---
   spamoor eoatx --slot-duration 2s -t 2000 --amount 50
   Load 10.0 min: 300 blocks, avg 2.00 s, max gap 4 s
-  598,000 txs = 996.7 tx/s (requested 1,000 tx/s = 2000 per 2s slot); after first 2 min 1,000.1 tx/s
+  598,000 txs = 996.7 tx/s = 99.7% of requested 1,000 tx/s (2000 per 2s slot); after first 2 min 1,000.1 tx/s = 100.0%
   Tx/block avg 1,993, max 2000
   Gas/block avg 41.9 Mgas, max 42.0 Mgas = 20.9 Mgas/s; 41.86% of the 100.0 Mgas limit avg, 42.00% max
   Stopping spamoor (6 s after load end; pod delete took 4 s): 3 blocks, 6,000 txs
@@ -297,6 +297,7 @@ prints a summary that fits on one screen, and saves it as `summary.txt` and in
     validator-2  prop 75; build 1,510/1,830 over 0%; pend 50,100/50,000; restarts 0->0; WARN 2 ERROR 0
     validator-3  prop 75; build 1,480/1,790 over 0%; pend 49,800/49,800; restarts 0->0; WARN 0 ERROR 0
     validator-4  prop 75; build 1,512/1,840 over 0%; pend 50,000/49,900; restarts 0->0; WARN 1 ERROR 0
+  STALL +312 s into load: #48210-#48216 (7 blocks, 12 s) 0 txs, pending flat: validator-1 4,096, validator-3 4,096
   Most common WARN/ERROR across validator logs (whole run):
         6 x WARN RoundTimer | ...
   Health: healthy after 33 s; fix-ups: none
@@ -305,7 +306,7 @@ prints a summary that fits on one screen, and saves it as `summary.txt` and in
     validator-1  cpu  0.98 (0.71) / 40   mem  1.8Gi / 1.9Gi  ! mem 95% of limit
     ...
     spamoor      cpu  3.20 (2.50) / 40   mem  2.1Gi / 160.0Gi
-  spamoor.log 1.2 MB: error lines 0, warning lines 0
+  spamoor.log 1.2 MB: error lines 0, warning lines 0; send errors 0 (0.0% of 610,000 requested)
 ```
 
 If spamoor was restarted or stopped early, extra lines say so, e.g.
@@ -328,7 +329,9 @@ Where each figure comes from:
   load point to block building or import not keeping up.
 - **Requested tx/s** is `throughput / slotDuration`, which assumes spamoor's `-t` is
   transactions per slot. If tx/block sits near `throughput` while blocks keep to the slot
-  time, that assumption holds.
+  time, that assumption holds. The **% of requested** (`Deliv %` in the table) is the
+  achieved tx/s (txs included on chain) over that; the whole window includes spamoor's
+  ramp-up, so the after-2-minutes figure is the one to compare.
 - **"After first 2 min"** uses the same cut as the analysis rule in `CLAUDE.md` (spamoor
   ramp-up, JVM warmup). It's only shown for load windows over 3 minutes.
 - **Gas**: absolute gas per block and Mgas/s (total gas in the load window over its
@@ -361,6 +364,13 @@ Where each figure comes from:
 - **Txpool pending**: the `N pending` in every `Produced`/`Imported` line (all Besu
   versions), i.e. each validator's txpool size after each load block. A pool still
   growing at load end means the load exceeds what the chain can take.
+- **STALL**: 5 or more consecutive load blocks (`$stallBlocks`) with 0 txs while a
+  validator's pending count stays exactly the same and above 0: transactions are waiting
+  but no proposer includes them (e.g. not executable, or selection broken). Found per
+  validator, then overlapping block ranges are merged into one line naming each
+  validator and its stuck pending count. The screen shows up to 3; `validators.txt` lists
+  every one per validator. Adds `STALL x<n> (<blocks> blocks)` first in the table's notes.
+  Load window only: after spamoor stops, empty blocks are expected.
 - **CPU/memory**: `top.log` samples inside the load window, against the container limits
   in `meta.limits` (`-` if none). Memory limits are converted to Gi, so a decimal `2G`
   shows as `1.9Gi`. Any container whose max reaches 95% of a limit is marked `!` and
@@ -368,14 +378,22 @@ Where each figure comes from:
   risk.
 - **Warnings/errors**: counts of `WARN`/`ERROR` lines in each validator's log (the whole
   run, not just the load), and the three most common messages across all of them
-  (numbers and hashes blanked so repeats group). For `spamoor.log`: its size, the count of `level=error` (and `panic:`)
-  and `level=warning` lines, and the three most common of those messages. It's read in
-  one streaming pass because it can be over 1 GB.
+  (numbers and hashes blanked so repeats group). For `spamoor.log`: its size, the count
+  of `level=error` (and `panic:`) and `level=warning` lines, and the three most common of
+  those messages. It's read in one streaming pass because it can be over 1 GB.
+- **Send errors**: the `spamoor.log` warning/error lines that mention sending
+  (`$sendErrorPattern`: the words send/sending/submit/broadcast, or `send…Transaction`),
+  i.e. roughly one per transaction the RPC node rejected. Shown as a count and as a % of
+  the transactions requested while spamoor was sending (`loadStartUtc` to
+  `spamoorStoppedUtc`), on screen and in the table's `Send err`. If spamoor's wording
+  doesn't match, the count is 0 while the warning lines aren't: check the most common
+  messages and adjust the pattern.
 - **spamoor failures**: a retry, or a pod not `Running` at load end, adds a line and a
   note. A load window cut short puts `SPAMOOR FAILED at <n> min` first in the notes.
 
 The end-of-batch table has one row per run: requested and achieved tx/s (also after the
-first 2 minutes), average and max tx/block, Mgas/s, average gas used %, average block time (`Blk s`), the longest gap between
+first 2 minutes), achieved as a % of requested (`Deliv %`, whole window/after 2 minutes),
+spamoor send errors (`Send err`, count and % of requested), average and max tx/block, Mgas/s, average gas used %, average block time (`Blk s`), the longest gap between
 consecutive load blocks in seconds (`Max gap s`, see above),
 block build time avg/p95 in ms and the % of blocks built over the slot (every
 validator's blocks after the first 2 minutes; empty for Besu without timings), the
@@ -383,7 +401,7 @@ largest txpool pending count on any validator during the load and which one
 (`Max pending`, the whole load window; a value close to the txpool's capacity means the
 pool filled up), the
 highest Besu CPU and memory (and which pod), the run's `extraArgs`, and notes such as
-errors, fix-ups, restarts and containers at 95%+ of a limit. If the summary itself
+stalls, errors, fix-ups, restarts and containers at 95%+ of a limit. If the summary itself
 fails, the run is still packaged and the table row says why. Above the table, the title
 names the group folder and batch start time, then the plan's `label`. The table is also saved as
 `runs\[<group>\]<yyyyMMdd-HHmmss>-batch-summary.txt` (the batch's start time, so a reused
