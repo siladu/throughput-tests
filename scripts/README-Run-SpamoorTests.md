@@ -242,8 +242,8 @@ before any load, every run checks the network over RPC.
 - After each poll, every pod that is missing static peers is asked to dial them with
   `admin_addPeer`, from both ends of the link. This usually repairs the links within a
   poll or two, without any restart.
-- Every poll prints one progress line. `p` is the peer count, unhealthy pods are marked
-  with `!`:
+- Polls are silent. Only if `healthTimeoutSeconds` runs out does it print the last poll's
+  state, one line. `p` is the peer count, unhealthy pods are marked with `!`:
 
   ```
     [00:40] rpc-1 4p #385437 | validator-1 3p #385437 missing validator-4 ! | ... | validator-4 2p #385437 missing validator-1,validator-2 ! | +3/5 blocks

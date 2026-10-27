@@ -278,10 +278,13 @@ function Wait-NetworkHealthy {
                 $s
             }
             $elapsed = (Get-Date) - $t0
-            Write-Host ('  [{0:mm\:ss}] {1} | +{2}/{3} blocks' -f $elapsed, ($parts -join ' | '), $newBlocks, $minNewBlocks)
 
             $healthy = ($bad.Count -eq 0 -and $newBlocks -ge $minNewBlocks)
             if ($healthy -or $elapsed.TotalSeconds -ge $healthTimeoutSeconds) {
+                # Peer state is only worth showing when it explains a timeout
+                if (-not $healthy) {
+                    Write-Host ('  [{0:mm\:ss}] {1} | +{2}/{3} blocks' -f $elapsed, ($parts -join ' | '), $newBlocks, $minNewBlocks)
+                }
                 return @{
                     Healthy = $healthy; Stalled = ($newBlocks -lt $minNewBlocks); Bad = $bad
                     Missing = $missing; Peers = $peers; Heads = $heads
