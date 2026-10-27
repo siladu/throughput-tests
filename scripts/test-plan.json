@@ -1,10 +1,10 @@
 {
-  "label": "describe this batch: Besu version, config under test",
+  "label": "upgrade bonsai - baseline with repeats 2",
   "image": "spamoor:v1.2.4",
   "namespace": "besu-consensus",
   "validatorPod": "besu-node-validator-1-0",
   "rpcUrl": "http://besu-node-rpc-1-0.besu-node-rpc-1.besu-consensus.svc.cluster.local:8545",
-  "scenario": "eoatx",
+  "scenario": "erc20tx",
   "slotDuration": "2s",
   "resetNetwork": true,
   "warmupSeconds": 60,
@@ -13,9 +13,11 @@
   "cooldownSeconds": 60,
   "sampleSeconds": 30,
   "runs": [
-    { "durationMinutes": 10, "throughput": 2000, "amount": 50 },
-    { "durationMinutes": 10, "throughput": 4000, "amount": 50 },
-    { "durationMinutes": 10, "throughput": 16000, "amount": 50,
-      "extraArgs": ["--max-pending", "1000000", "--max-wallets", "4000"] }
+    { "durationMinutes": 5, "throughput": 12000, "amount": 1, "extraArgs": ["--max-pending", "60000",  "--max-wallets", "100"] },
+    { "durationMinutes": 5, "throughput": 12000, "amount": 1, "extraArgs": ["--max-pending", "80000",  "--max-wallets", "100"] },
+    { "durationMinutes": 5, "throughput": 16000, "amount": 1, "extraArgs": ["--max-pending", "60000",  "--max-wallets", "100"] },
+    { "durationMinutes": 5, "throughput": 12000, "amount": 1, "extraArgs": ["--max-pending", "100000", "--max-wallets", "100"] },
+    { "durationMinutes": 5, "throughput": 16000, "amount": 1, "extraArgs": ["--max-pending", "80000",  "--max-wallets", "100"] },
+    { "durationMinutes": 5, "throughput": 12000, "amount": 1, "extraArgs": ["--max-pending", "60000",  "--max-wallets", "100"] }
   ]
 }
