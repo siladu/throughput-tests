@@ -90,13 +90,14 @@ All parameters have defaults.
 | `-Zip` | off | Also zip each run folder, as `runs\[<group>\]<runId>.zip` next to the folder. Left uncommitted |
 | `-Push` | off | Zip (as `-Zip`), then commit and push each zip as it finishes |
 
-## Plan settings for the health check
+## Other plan settings
 
 | Field | Default if absent | Meaning |
 |---|---|---|
 | `healthTimeoutSeconds` | 300 | How long one health wait lasts before a fix-up (or giving up) |
 | `maxFixups` | 2 | Fix-ups (full reset or single-pod restart) allowed per run before the run is abandoned |
 | `rpcPod` | first label of `rpcUrl`'s host | Pod whose log is streamed as `rpc.log` (the node spamoor sends to) |
+| `label` | none | Free text saying what the batch tests (Besu version, config). Printed at startup, in each run's summary header, in the batch summary and as `meta.label` |
 | `validatorPod` | first validator | Validator the summary reads blocks from over RPC. Every validator's log is streamed whatever this says |
 
 Validators are the Besu pods whose name contains `validator`, found once at startup and
@@ -274,7 +275,7 @@ prints a summary that fits on one screen, and saves it as `summary.txt` and in
 `meta.json` (`summary`). Example:
 
 ```
-  --- Summary: 20261016-140623-t2000 ---
+  --- Summary: 20261016-140623-tps1000 (Besu 26.9.0, txpool defaults) ---
   spamoor eoatx --slot-duration 2s -t 2000 --amount 50
   Load 10.0 min: 300 blocks, avg 2.00 s, max gap 4 s
   598,000 txs = 996.7 tx/s (requested 1,000 tx/s = 2000 per 2s slot); after first 2 min 1,000.1 tx/s
@@ -383,7 +384,8 @@ largest txpool pending count on any validator during the load and which one
 pool filled up), the
 highest Besu CPU and memory (and which pod), the run's `extraArgs`, and notes such as
 errors, fix-ups, restarts and containers at 95%+ of a limit. If the summary itself
-fails, the run is still packaged and the table row says why. The table is also saved as
+fails, the run is still packaged and the table row says why. Above the table, the title
+names the group folder and batch start time, then the plan's `label`. The table is also saved as
 `runs\[<group>\]<yyyyMMdd-HHmmss>-batch-summary.txt` (the batch's start time, so a reused
 group doesn't overwrite an earlier batch's table), and committed and pushed with `-Push`.
 

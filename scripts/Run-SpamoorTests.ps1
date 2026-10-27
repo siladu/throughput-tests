@@ -666,7 +666,9 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
         'Extra args' = $extra; Notes = ''
     }
     $notes = @()
-    $lines.Add("--- Summary: $($Meta.runId) ---")
+    $head = "--- Summary: $($Meta.runId)"
+    if ($Meta.label) { $head += " ($($Meta.label))" }
+    $lines.Add("$head ---")
     $lines.Add("spamoor $($plan.scenario) --slot-duration $($plan.slotDuration) -t $($Run.throughput) --amount $($Run.amount) $extra".TrimEnd())
 
     # Blocks and transactions, from the chain
@@ -897,6 +899,7 @@ function Publish-Run([string]$ZipPath, [string]$Message) {
 
 $plan            = Get-Content $PlanFile -Raw | ConvertFrom-Json
 $runs            = @($plan.runs)
+$batchLabel      = [string]$plan.label   # optional: what this batch is testing, for the batch summary
 $ns              = $plan.namespace
 $cooldownSeconds = [int]$plan.cooldownSeconds
 $warmupSeconds   = [int]$plan.warmupSeconds
@@ -978,6 +981,7 @@ if ($Group) { $runsDir = Join-Path $runsDir $Group }
 New-Item -ItemType Directory -Force -Path $runsDir | Out-Null
 
 $loadMinutes = ($runs | Measure-Object -Property durationMinutes -Sum).Sum
+if ($batchLabel) { Write-Host "Batch: $batchLabel" }
 Write-Host "$($runs.Count) runs, $loadMinutes min of load plus setup/cooldown per run."
 Write-Host "Network reset before each run: $doReset. Results go to $runsDir."
 Write-Host "Health check covers: $($besuPods -join ', ')"
@@ -1021,6 +1025,7 @@ foreach ($run in $runs) {
     $meta = [ordered]@{
         runId           = $runId
         group           = $Group
+        label           = $batchLabel
         name            = $runName
         image           = $plan.image                                  # without the registry
         durationMinutes = $run.durationMinutes
@@ -1211,7 +1216,12 @@ foreach ($run in $runs) {
     }
 }
 
-$batchTitle = "=== Batch summary: $($summaryRows.Count) run(s), load window only; 2m+ excludes the first 2 min; Build ms (avg/p95) and Over slot: every validator's blocks, 2m+ ==="
+# The plan's label says what the batch was testing; the group folder and start time say where to find it
+$batchWhere = "runs\, started $batchStamp"
+if ($Group) { $batchWhere = "runs\$Group\, started $batchStamp" }
+$batchTitle = "=== Batch summary: $($summaryRows.Count) run(s) in $batchWhere ==="
+if ($batchLabel) { $batchTitle += "`nLabel: $batchLabel" }
+$batchTitle += "`nLoad window only; 2m+ excludes the first 2 min; Build ms (avg/p95) and Over slot: every validator's blocks, 2m+"
 $batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap s', 'Build ms', 'Over slot', 'Max pending', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
     Out-String -Width 300
 Write-Host "`n$batchTitle"

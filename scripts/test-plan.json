@@ -1,4 +1,5 @@
 {
+  "label": "describe this batch: Besu version, config under test",
   "image": "spamoor:v1.2.4",
   "namespace": "besu-consensus",
   "validatorPod": "besu-node-validator-1-0",

@@ -93,7 +93,9 @@ Errors in one run are recorded in `meta.json` and the loop moves on.
 Top level: `image` (`name:tag` only, no registry), `namespace`, `rpcUrl`,
 `scenario` (spamoor subcommand), `slotDuration`, `resetNetwork`, `warmupSeconds`,
 `healthTimeoutSeconds`, `maxFixups`, `cooldownSeconds`, `sampleSeconds`, `runs`, and
-optional `rpcPod` (defaults to the first label of `rpcUrl`'s host) and `validatorPod`
+optional `label` (free text saying what the batch tests, e.g. Besu version and config;
+printed in the batch summary, each run's summary header and `meta.label`), `rpcPod`
+(defaults to the first label of `rpcUrl`'s host) and `validatorPod`
 (the validator the summary reads blocks from over RPC; defaults to the first one; every
 validator's log is captured regardless).
 
@@ -103,7 +105,7 @@ apart runs at the same rate; it becomes part of the run ID and pod name, keep it
 lowercase, `[a-z0-9-]`), `durationMinutes` (expected 5-15), `throughput` (spamoor `-t`), `amount`
 (spamoor `--amount`), optional `extraArgs` (array of extra spamoor CLI args).
 
-When editing the plan, tell the user the rough total wall time
+When editing the plan, update `label` to match what the batch tests, and tell the user the rough total wall time
 (sum of durations + per-run warmup/cooldown + a few minutes per network restart and health
 check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are needed).
 
@@ -124,7 +126,7 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
 - `validators.txt`: per validator, its own build-timing table, txpool pending
   avg/max/end, restarts and most common WARN/ERROR messages.
 - `top.log`: `<UTC timestamp> <pod> <container> <cpu> <memory>` samples for every pod.
-- `meta.json`: parameters (incl. `group`, `resetNetwork`, `warmupSeconds`), UTC timestamps
+- `meta.json`: parameters (incl. `group`, `label`, `resetNetwork`, `warmupSeconds`), UTC timestamps
   (`logStartUtc`, `healthyUtc`, `loadStartUtc`, `loadEndUtc`, `spamoorStoppedUtc`,
   `endUtc`; spamoor keeps sending between `loadEndUtc` and `spamoorStoppedUtc`, so the
   txpool drain starts at the latter), `health` (`secondsToHealthy`, `fixups`, final
