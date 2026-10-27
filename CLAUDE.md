@@ -63,7 +63,10 @@ Per run in `test-plan.json`:
 3. Stream every validator's (Besu pods named `*validator*`) and the RPC node's logs with
    `kubectl logs -f --since-time=<logStartUtc>`, which backfills the reset and health
    check. Streaming is used instead of a one-off `kubectl logs` because kubelet log
-   rotation would drop lines. Then wait `warmupSeconds` if there was a reset or fix-up.
+   rotation would drop lines. A stream that ends on its own while its container runs
+   (seen under heavy load) is restarted with an overlapping `--since-time`, and the parts
+   are joined without the duplicated lines. Then wait `warmupSeconds` if there was a
+   reset or fix-up.
 4. Render the template and apply the spamoor pod; wait for Ready, then stream its log
    too. If spamoor exits within 60 s, keep that log and start it once more.
 5. For `durationMinutes`, sample `kubectl top pods --containers` every `sampleSeconds`.
@@ -134,15 +137,19 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
   txpool drain starts at the latter), `health` (`secondsToHealthy`, `fixups`, final
   `peers`/`heads` per pod), `limits` (CPU/memory limit per `<pod>/<container>`),
   `validatorPods`, per validator: `validatorNodes`, `validatorRestartsBefore`/`After`,
-  `logStreamDiedEarly`; also `spamoorNode`, `rpcLogStreamDiedEarly`,
+  `logStreamDiedEarly` (stream ended and wasn't restarted: log cut short, not a pod
+  restart); also `logStreamRestarts` (log file → count), `spamoorNode`, `rpcLogStreamDiedEarly`,
   `spamoorPhase`, `spamoorAttempts`, `spamoorFailures`, `spamoorDeleteSeconds`, `error`
   if any.
 - `fixup-<n>-<pod>.log`: logs taken just before a fix-up (the restarted pod, or every pod
   for a full reset). Evidence for the startup peering problem (see Cluster context).
 - `unhealthy-<pod>.log`: present when the run was abandoned because the network never
   became healthy (no load was sent).
-- `validator-<N>-fallback.log` / `validator-<N>-previous.log`: only present if that
-  validator restarted mid-run. A restart during a run usually means OOMKilled; flag it.
+- `validator-<N>-previous.log`: only present if that validator's restart count changed
+  mid-run (the previous container's log). A restart during a run usually means
+  OOMKilled; flag it. Runs before 2026-10-27 may also have `validator-<N>-fallback.log`,
+  and flagged `RESTARTED MID-RUN` whenever a log stream ended, even with restart counts
+  unchanged; trust the counts.
 
 ## Analysing results
 
@@ -161,7 +168,9 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
   untrimmed figures alongside.
 - Compare runs on: block production rate and gaps, transactions per block, achieved vs
   requested throughput (`Deliv %`), stalls, spamoor send errors, spamoor at its pending cap
-  (`At cap`: near 100% means `--max-pending` limited the load, not the network), block build time (total and per phase) and blocks built over the
+  (`At cap`: near 100% means `--max-pending` limited the load, not the network; it reads
+  high with big blocks because spamoor refills freed slots before logging the block, so
+  in flight can show over 100% of the hard cap), block build time (total and per phase) and blocks built over the
   slot, txpool size, validator CPU/memory under load, restarts, and errors/warnings in
   the validator logs. Build timings only exist from Besu versions that log
   `Produced ... Timing(...)`, so don't compare them with runs on older Besu. Runs before
@@ -169,6 +178,10 @@ check; up to `(maxFixups + 1) × healthTimeoutSeconds` extra if fix-ups are need
   runs pool every validator's blocks, so compare those figures with care.
 - Check the requested load was actually generated (spamoor.log) before concluding the
   network was the bottleneck.
+- Check log coverage before using log-derived figures (build times, txpool, spamoor
+  pending/At cap): `Produced lines for N of M load blocks` and spamoor's `N of M load
+  blocks logged` should be near M (notes `validator logs N%` / `spamoor log N%` flag
+  gaps). Chain-derived figures (Tx/s, Mgas/s, block times) don't depend on the logs.
 - Present findings as a comparison across runs, and say which runs are not comparable
   (different settings, errors, restarts).
 

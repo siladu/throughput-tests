@@ -180,21 +180,140 @@ function Save-PodLog([string]$Pod, [string]$Since, [string]$Path) {
     Save-NativeOutput $kubectl @('logs', '-n', $ns, $Pod, "--since-time=$Since") $Path
 }
 
-# Follows a pod's logs into $Path in the background, from $Since (or the container's
-# start). Survives kubelet log rotation, which a one-off 'kubectl logs' at the end would
-# not. Ends by itself when the container stops.
-function Start-LogStream([string]$Pod, [string]$Path, [string]$Since) {
+function Start-LogProcess([string]$Pod, [string]$Path, [string]$Since) {
     $a = @('logs', '-f', '-n', $ns, $Pod)
     if ($Since) { $a += "--since-time=$Since" }
     Start-Process -FilePath $kubectl -NoNewWindow -PassThru -ArgumentList $a `
         -RedirectStandardOutput $Path -RedirectStandardError "$Path.stderr"
 }
 
-# Gives a stream up to $WaitSeconds to finish by itself (its container stopping), then kills it
-function Stop-LogStream($Proc, [int]$WaitSeconds = 0) {
-    if (-not $Proc) { return }
-    if ($WaitSeconds -gt 0 -and -not $Proc.HasExited) { $Proc.WaitForExit($WaitSeconds * 1000) | Out-Null }
-    if (-not $Proc.HasExited) { Stop-Process -Id $Proc.Id -Force }
+# Follows a pod's logs into $Path in the background, from $Since (or the container's
+# start). Streaming keeps lines that kubelet log rotation would hide from a one-off
+# 'kubectl logs' at the end (it only reads the current file). 'kubectl logs -f' can
+# itself end early (seen on every stream at once under heavy load, with restart counts
+# unchanged), so Watch-LogStreams restarts it; Stop-LogStream stitches the parts together.
+function Start-LogStream([string]$Pod, [string]$Path, [string]$Since) {
+    $seen = $Since
+    if (-not $seen) { $seen = Get-UtcStamp }
+    [pscustomobject]@{
+        Pod = $Pod; Path = $Path; Proc = (Start-LogProcess $Pod $Path $Since)
+        SeenUtc     = $seen      # last time the stream was seen running (or its start)
+        Parts       = @()        # restarted streams: Path (<Path>.part<N>), Anchor
+        Restarts    = 0
+        LastRestart = Get-Date
+        Done        = $false
+        EndedEarly  = $false     # had ended by itself, and not been restarted, when stopped
+    }
+}
+
+# Reads up to $Count bytes of a file from $From (negative: from the end) as a Latin-1
+# string, so character offsets are byte offsets. The file may still be being written.
+function Read-FileText([string]$Path, [long]$From, [long]$Count) {
+    $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try {
+        if ($From -lt 0) { $From = [Math]::Max(0, $fs.Length + $From) }
+        $n = [int][Math]::Max(0, [Math]::Min($Count, $fs.Length - $From))
+        $buf = New-Object byte[] $n
+        $fs.Seek($From, [IO.SeekOrigin]::Begin) | Out-Null
+        $read = 0
+        while ($read -lt $n) {
+            $r = $fs.Read($buf, $read, $n - $read)
+            if ($r -le 0) { break }
+            $read += $r
+        }
+    } finally { $fs.Close() }
+    return $latin1.GetString($buf, 0, $read)
+}
+
+# The last $anchorLines complete lines of a log ($null if none): a restarted stream
+# re-sends them, so they mark where its new lines start
+function Get-LogAnchor([string]$Path) {
+    if (-not (Test-Path $Path)) { return $null }
+    $text = Read-FileText $Path (-64KB) 64KB
+    $end  = $text.LastIndexOf([char]10)
+    if ($end -lt 0) { return $null }
+    $start = $end
+    for ($i = 0; $i -lt $anchorLines -and $start -ge 0; $i++) {
+        if ($start -eq 0) { break }
+        $start = $text.LastIndexOf([char]10, $start - 1)
+    }
+    return $text.Substring($start + 1, $end - $start)
+}
+
+# Byte offset in $Path just past $Anchor at the start of a line, searched for in its
+# first $anchorSearchMB; 0 if not found (the parts don't overlap, e.g. a new container)
+function Find-LogOverlapEnd([string]$Path, [string]$Anchor) {
+    if (-not $Anchor) { return 0 }
+    $text = Read-FileText $Path 0 ($anchorSearchMB * 1MB)
+    $i = $text.IndexOf($Anchor, [StringComparison]::Ordinal)
+    while ($i -gt 0 -and $text[$i - 1] -ne [char]10) { $i = $text.IndexOf($Anchor, $i + 1, [StringComparison]::Ordinal) }
+    if ($i -lt 0) { return 0 }
+    return $i + $Anchor.Length
+}
+
+# Restarts each stream that has ended while its container is still running, into
+# <Path>.part<N>, from $streamOverlapSeconds before it was last seen running (so nothing
+# in between is missed; Stop-LogStream drops the lines sent twice). At most one restart
+# per stream every $streamRetrySeconds, $maxStreamRestarts in all.
+function Watch-LogStreams($Streams) {
+    foreach ($s in @($Streams | Where-Object { $_ -and -not $_.Done })) {
+        if (-not $s.Proc.HasExited) { $s.SeenUtc = Get-UtcStamp; continue }
+        if ($s.Restarts -ge $maxStreamRestarts -or ((Get-Date) - $s.LastRestart).TotalSeconds -lt $streamRetrySeconds) { continue }
+        if (-not (Get-PodField $s.Pod '{.status.containerStatuses[0].state.running.startedAt}')) { continue }
+        $prev = $s.Path
+        if ($s.Parts.Count -gt 0) { $prev = $s.Parts[-1].Path }
+        $anchor = Get-LogAnchor $prev
+        if (-not $anchor -and $s.Parts.Count -gt 0) { $anchor = $s.Parts[-1].Anchor }   # that attempt got nothing
+        $s.Restarts++
+        $s.LastRestart = Get-Date
+        $since = [DateTimeOffset]::Parse($s.SeenUtc).AddSeconds(-$streamOverlapSeconds).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss'Z'")
+        $part  = "$($s.Path).part$($s.Restarts)"
+        Write-Warning "$(Split-Path $s.Path -Leaf) stream ended; restarting it from $since (restart $($s.Restarts))"
+        $s.Parts += [pscustomobject]@{ Path = $part; Anchor = $anchor }
+        $s.Proc = Start-LogProcess $s.Pod $part $since
+    }
+}
+
+# The current run's log streams (set in the test loop)
+function Get-RunStreams { @($logStreams.Values) + @($rpcStream, $spamStream) | Where-Object { $_ } }
+
+# Sleeps $Seconds, checking the log streams every $streamCheckSeconds
+function Wait-Streaming([double]$Seconds, $Streams) {
+    $until = (Get-Date).AddSeconds($Seconds)
+    while ($true) {
+        Watch-LogStreams $Streams
+        $left = ($until - (Get-Date)).TotalSeconds
+        if ($left -le 0) { return }
+        Start-Sleep -Milliseconds ([int](1000 * [Math]::Min($streamCheckSeconds, $left)))
+    }
+}
+
+# Gives a stream up to $WaitSeconds to finish by itself (its container stopping), then
+# kills it, and appends any restarted parts to its log without the lines sent twice
+function Stop-LogStream($Stream, [int]$WaitSeconds = 0) {
+    if (-not $Stream -or $Stream.Done) { return }
+    $Stream.Done       = $true
+    $Stream.EndedEarly = $Stream.Proc.HasExited
+    $p = $Stream.Proc
+    if ($WaitSeconds -gt 0 -and -not $p.HasExited) { $p.WaitForExit($WaitSeconds * 1000) | Out-Null }
+    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; $p.WaitForExit(5000) | Out-Null }
+    foreach ($part in $Stream.Parts) {
+        if ((Test-Path $part.Path) -and (Get-Item $part.Path).Length -gt 0) {
+            $from = Find-LogOverlapEnd $part.Path $part.Anchor
+            # A line cut off mid-write shouldn't run into the next part's first line
+            $cut  = (Test-Path $Stream.Path) -and (Get-Item $Stream.Path).Length -gt 0 -and
+                (Read-FileText $Stream.Path (-1) 1) -ne "`n"
+            $out  = [IO.File]::Open($Stream.Path, [IO.FileMode]::Append, [IO.FileAccess]::Write)
+            $in   = [IO.File]::OpenRead($part.Path)
+            try {
+                if ($cut) { $out.WriteByte(10) }
+                $in.Seek($from, [IO.SeekOrigin]::Begin) | Out-Null
+                $in.CopyTo($out)
+            } finally { $in.Close(); $out.Close() }
+        }
+        Remove-Item $part.Path -ErrorAction SilentlyContinue
+        Remove-EmptyFile "$($part.Path).stderr"
+    }
 }
 
 # Polls every Besu pod's RPC (through kubectl port-forward) until each is connected to all
@@ -577,6 +696,12 @@ function Get-ValidatorSummary($Load, $SteadyFrom, $Meta, [string]$RunDir) {
                 $out.OverSlot = '{0:N0}%' -f $t.OverPct
             }
         }
+        # One validator produces each block, so fewer Produced lines than blocks means the logs have gaps
+        $cover = 100 * $produced.Count / $Load.Count
+        if ($Load.Count -ge 10 -and $produced.Count -gt 0 -and $cover -lt $minLogCoveragePct) {
+            $lines.Add(('! Produced lines for only {0:N0}% of load blocks: validator logs have gaps, so build times and txpool sizes are a partial sample' -f $cover))
+            $out.Notes += 'validator logs {0:N0}% of blocks' -f $cover
+        }
     }
 
     $before = $Meta.validatorRestartsBefore
@@ -585,6 +710,8 @@ function Get-ValidatorSummary($Load, $SteadyFrom, $Meta, [string]$RunDir) {
     if (-not $after) { $after = @{} }
     $died = $Meta.logStreamDiedEarly
     if (-not $died) { $died = @{} }
+    $streamRestarts = $Meta.logStreamRestarts
+    if (-not $streamRestarts) { $streamRestarts = @{} }
     if ($logs.Count -eq 0 -and $before.Count -eq 0) {
         $lines.Add('No validator logs.')   # abandoned before the streams started
         return $out
@@ -595,10 +722,18 @@ function Get-ValidatorSummary($Load, $SteadyFrom, $Meta, [string]$RunDir) {
     foreach ($pod in $Meta.validatorPods) {
         $short = Get-ShortName $pod
         $detail.Add("--- $short ---")
+        # Only a changed restart count is a restart: a log stream can end without one
         $rs = "restarts $($before[$pod])->$($after[$pod])"
-        if (($null -ne $before[$pod] -and $before[$pod] -ne $after[$pod]) -or $died[$pod]) {
+        if ($null -ne $before[$pod] -and $before[$pod] -ne $after[$pod]) {
             $rs += ' RESTARTED MID-RUN'
             $out.Notes += "$short restarted"
+        }
+        $sr = [int]$streamRestarts["$short.log"]
+        if ($died[$pod]) {
+            $rs += '; LOG STREAM ENDED EARLY, log cut short'
+            $out.Notes += "$short log cut short"
+        } elseif ($sr -gt 0) {
+            $rs += "; log stream restarted ${sr}x"
         }
         $log = $logs[$pod]
         if (-not $log) {
@@ -727,14 +862,18 @@ function Get-SpamoorPendingCap($Run) {
 }
 
 # spamoor's own pending count at each load block, from its per-block line
-# ('block N: submitted=.., pending=.., confirmed=..'), against its cap. spamoor logs that
-# line after marking the block's txs confirmed, so pending is the low point; the cap
-# binds just before the block, at pending + confirmed ('in flight'). A block counts as at
-# the cap when that is $spamCapPct% of the cap or more. $Blocks: block number ->
-# Pending/InFlight. Returns Lines and the batch table's SpamPend and AtCap (after the
-# first 2 min when $SteadyFrom is set).
+# ('block N: submitted=.., pending=.., confirmed=..'), against its cap. In v1.2.4 the cap
+# is hard: before every send it waits until fewer than --max-pending txs are unconfirmed
+# (scenario/txscenario.go). The per-block line is logged after the block's txs are
+# confirmed, so pending is the low point; pending + confirmed ('in flight') estimates the
+# count just before the block, where the cap binds. It overstates by the slots spamoor
+# has already refilled while confirming the block (pending is read after that), so it
+# can go over the cap, more so with bigger blocks, and 'at cap' reads high by the same
+# amount. A block counts as at the cap when in flight is $spamCapPct% of the cap or more.
+# $Blocks: block number -> Pending/InFlight. Returns Lines, Notes and the batch table's
+# SpamPend and AtCap (after the first 2 min when $SteadyFrom is set).
 function Get-SpamoorPendingSummary($Blocks, $Load, $SteadyFrom, $Run) {
-    $out  = @{ Lines = @(); SpamPend = ''; AtCap = '' }
+    $out  = @{ Lines = @(); Notes = @(); SpamPend = ''; AtCap = '' }
     $seen = @($Load | Where-Object { $Blocks.ContainsKey($_.Number) })
     if ($seen.Count -eq 0) {
         if ($Load.Count -gt 0) { $out.Lines += 'spamoor pending: no per-block lines (block N: ... pending=N) for load blocks in spamoor.log' }
@@ -744,8 +883,15 @@ function Get-SpamoorPendingSummary($Blocks, $Load, $SteadyFrom, $Run) {
     $peak = ($seen | ForEach-Object { $Blocks[$_.Number].InFlight } | Measure-Object -Maximum).Maximum
     $out.SpamPend = '{0:N0}' -f $max
     $cap = Get-SpamoorPendingCap $Run
-    $out.Lines += 'spamoor pending ({0} of {1} load blocks logged): max {2:N0}; in flight before the block (+ its confirmed) max {3:N0}' -f
+    $line = 'spamoor pending ({0} of {1} load blocks logged): max {2:N0}; in flight before the block (+ its confirmed) max {3:N0}' -f
         $seen.Count, $Load.Count, $max, $peak
+    if ($cap) { $line += ' = {0:N0}% of cap' -f (100 * $peak / $cap.Cap) }
+    $out.Lines += $line
+    $cover = 100 * $seen.Count / $Load.Count
+    if ($Load.Count -ge 10 -and $cover -lt $minLogCoveragePct) {
+        $out.Lines += '  ! only {0:N0}% of load blocks logged: spamoor.log has gaps, so these figures are a partial sample' -f $cover
+        $out.Notes += 'spamoor log {0:N0}% of blocks' -f $cover
+    }
     if (-not $cap) {
         $out.Lines += '  cap unknown (no --max-pending, scenario not eoatx)'
         return $out
@@ -764,8 +910,10 @@ function Get-SpamoorPendingSummary($Blocks, $Load, $SteadyFrom, $Run) {
         $line += ', after first 2 min {0:N0}%' -f $s
         $out.AtCap = '{0:N0}%' -f $s
     }
-    if ($peak -gt 1.05 * $cap.Cap) { $line += ' (in flight went over the cap: spamoor flags or version not as assumed)' }
     $out.Lines += $line
+    if ($peak -gt $cap.Cap) {
+        $out.Lines += '  (in flight over 100% of cap: spamoor refills the slots a block frees before logging the block, so in flight and at cap read high; the cap itself holds)'
+    }
     return $out
 }
 
@@ -876,6 +1024,16 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
         $lines.Add("Validator log stats unavailable: $_")
         $notes += 'no validator stats'
     }
+
+    # Log streams that ended early and were restarted (backfilled, lines sent twice dropped)
+    if ($Meta.logStreamRestarts) {
+        $sr = @($Meta.logStreamRestarts.GetEnumerator() | Where-Object { $_.Value -gt 0 } | ForEach-Object { "$($_.Key) $($_.Value)x" })
+        if ($sr.Count -gt 0) {
+            $lines.Add("Log streams restarted (backfilled from before they ended): $($sr -join ', ')")
+            $notes += 'log streams restarted'
+        }
+    }
+    if ($Meta.rpcLogStreamDiedEarly) { $notes += 'rpc.log cut short' }
 
     # Health before load
     if ($Meta.health) {
@@ -998,6 +1156,7 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
         if ($spamErrors -gt 0) { $notes += "spamoor errors $spamErrors" }
         $sp = Get-SpamoorPendingSummary $spamBlocks $load $steadyFrom $Run
         foreach ($l in $sp.Lines) { $lines.Add($l) }
+        $notes += $sp.Notes
         $row.'Spam pend' = $sp.SpamPend
         $row.'At cap'    = $sp.AtCap
     }
@@ -1082,6 +1241,15 @@ $spamoorGraceSeconds  = 5    # SIGTERM -> SIGKILL when stopping spamoor; it keep
 $slowDeleteSeconds    = 60   # a spamoor pod delete slower than this is warned about, with its events saved
 $stallBlocks          = 5    # this many 0-tx load blocks in a row with a validator's pending count unchanged is a stall
 $spamCapPct           = 95   # a load block where spamoor's in-flight txs are at this % of its max-pending cap counts as at the cap
+$minLogCoveragePct    = 90   # summary flags a log with per-block lines for fewer than this % of load blocks
+# Log streams that end early are restarted (see Watch-LogStreams)
+$streamCheckSeconds   = 2    # how often streams are checked while waiting
+$streamRetrySeconds   = 10   # at most one restart per stream this often ...
+$maxStreamRestarts    = 30   # ... and this many per stream per run
+$streamOverlapSeconds = 10   # a restarted stream starts this long before it was last seen running
+$anchorLines          = 3    # lines from the end of one part that mark where the next part's new lines start
+$anchorSearchMB       = 64   # how far into the next part to look for them
+$latin1               = [Text.Encoding]::GetEncoding(28591)   # bytes <-> chars 1:1, for byte offsets in logs
 # spamoor warning/error lines counted as send errors (one per tx the RPC node rejected).
 # Matches the verb rather than any one message, so reworded messages still count.
 $sendErrorPattern     = '(?i)\b(send|sending|submit|submitting|broadcast|broadcasting)\b|send\w*transaction'
@@ -1191,9 +1359,9 @@ foreach ($run in $runs) {
     foreach ($p in $validatorPods) { $valLogs[$p] = Join-Path $runDir "$(Get-ShortName $p).log" }
     $rpcLog       = Join-Path $runDir 'rpc.log'
     $spamLog      = Join-Path $runDir 'spamoor.log'
-    $logProcs     = @{}            # validator -> its log stream
-    $rpcLogProc   = $null
-    $spamLogProc  = $null
+    $logStreams   = @{}            # validator -> its log stream
+    $rpcStream    = $null
+    $spamStream   = $null
     $spamoorAlive = $false
 
     try {
@@ -1215,16 +1383,16 @@ foreach ($run in $runs) {
 
         # 2. Stream every validator's and the RPC node's logs. --since-time backfills the reset
         #    and health check, including the startup of a container restarted since then.
-        foreach ($p in $validatorPods) { $logProcs[$p] = Start-LogStream $p $valLogs[$p] $meta.logStartUtc }
-        if ($rpcPod) { $rpcLogProc = Start-LogStream $rpcPod $rpcLog $meta.logStartUtc }
-        Start-Sleep -Seconds 3
+        foreach ($p in $validatorPods) { $logStreams[$p] = Start-LogStream $p $valLogs[$p] $meta.logStartUtc }
+        if ($rpcPod) { $rpcStream = Start-LogStream $rpcPod $rpcLog $meta.logStartUtc }
+        Wait-Streaming 3 (Get-RunStreams)
 
         # Let a restarted network or pod settle before load
         $meta.warmupSeconds = 0
         if ($doReset -or $meta.health.fixups.Count -gt 0) {
             $meta.warmupSeconds = $warmupSeconds
             Write-Host "  Warming up for $warmupSeconds s ..."
-            Start-Sleep -Seconds $warmupSeconds
+            Wait-Streaming $warmupSeconds (Get-RunStreams)
         }
 
         # 3. Start spamoor, streaming its log from the start. If it exits within
@@ -1238,7 +1406,7 @@ foreach ($run in $runs) {
             Invoke-Native $kubectl @('apply', '-f', '-') -InputText $manifest | Out-Null
             $spamoorAlive = $true
             Invoke-Native $kubectl @('wait', '--for=condition=Ready', "pod/$podName", '-n', $ns, '--timeout=10m') | Out-Null
-            $spamLogProc = Start-LogStream $podName $spamLog ''
+            $spamStream = Start-LogStream $podName $spamLog ''
             $startedAt         = Get-Date
             $meta.spamoorNode  = Get-PodField $podName '{.spec.nodeName}'
             $meta.loadStartUtc = Get-UtcStamp
@@ -1262,13 +1430,13 @@ foreach ($run in $runs) {
                     break
                 }
                 $left = ($endAt - (Get-Date)).TotalSeconds
-                if ($left -gt 0) { Start-Sleep -Seconds ([int][Math]::Ceiling([Math]::Min([double]$sampleSeconds, $left))) }
+                if ($left -gt 0) { Wait-Streaming ([Math]::Min([double]$sampleSeconds, $left)) (Get-RunStreams) }
             }
             if (-not $restart) { break }
 
             $meta.spamoorFailures += [ordered]@{ attempt = $attempt; phase = $phase; secondsAfterStart = $secs; startUtc = $meta.loadStartUtc }
             Write-Warning "spamoor $phase $secs s after starting; log kept as spamoor-failed-$attempt.log. Starting it again ..."
-            Stop-LogStream $spamLogProc 10
+            Stop-LogStream $spamStream 10
             Move-Item $spamLog (Join-Path $runDir "spamoor-failed-$attempt.log") -Force
             Remove-EmptyFile "$spamLog.stderr"
             if (Test-Path "$spamLog.stderr") { Move-Item "$spamLog.stderr" (Join-Path $runDir "spamoor-failed-$attempt.log.stderr") -Force }
@@ -1291,26 +1459,37 @@ foreach ($run in $runs) {
             Save-NativeOutput $kubectl @('get', 'events', '-n', $ns, "--field-selector=involvedObject.name=$podName",
                 '-o', 'custom-columns=TIME:.lastTimestamp,TYPE:.type,REASON:.reason,MESSAGE:.message') (Join-Path $runDir 'spamoor-events.log')
         }
-        Stop-LogStream $spamLogProc 10
+        Stop-LogStream $spamStream 10
 
         # 6. Keep logging while the txpool drains
         Write-Host "  Cooldown $cooldownSeconds s ..."
-        Start-Sleep -Seconds $cooldownSeconds
+        Wait-Streaming $cooldownSeconds (Get-RunStreams)
     }
     catch {
         $meta.error = "$_"
         Write-Warning "Run $runId hit an error: $_"
     }
     finally {
-        $meta.logStreamDiedEarly = [ordered]@{}   # validator -> its stream had ended by itself
-        foreach ($p in $validatorPods) { $meta.logStreamDiedEarly[$p] = [bool]($logProcs[$p] -and $logProcs[$p].HasExited) }
-        $meta.rpcLogStreamDiedEarly = [bool]($rpcLogProc -and $rpcLogProc.HasExited)
-        foreach ($proc in $logProcs.Values) { Stop-LogStream $proc }
-        Stop-LogStream $rpcLogProc
+        foreach ($s in $logStreams.Values) { Stop-LogStream $s }
+        Stop-LogStream $rpcStream
         if ($spamoorAlive) {
             Invoke-Native $kubectl @('delete', 'pod', $podName, '-n', $ns, '--ignore-not-found', "--grace-period=$spamoorGraceSeconds", '--wait=true') -AllowFailure | Out-Null
         }
-        Stop-LogStream $spamLogProc
+        Stop-LogStream $spamStream
+    }
+
+    # A stream that ended early was restarted (Watch-LogStreams); one still ended when
+    # stopped left a gap at the end of its log
+    $meta.logStreamDiedEarly = [ordered]@{}   # validator -> its stream had ended, and not been restarted, by the end
+    $meta.logStreamRestarts  = [ordered]@{}   # log file -> times its stream was restarted
+    foreach ($p in $validatorPods) {
+        $s = $logStreams[$p]
+        $meta.logStreamDiedEarly[$p] = [bool]($s -and $s.EndedEarly)
+        if ($s) { $meta.logStreamRestarts[(Split-Path $s.Path -Leaf)] = $s.Restarts }
+    }
+    $meta.rpcLogStreamDiedEarly = [bool]($rpcStream -and $rpcStream.EndedEarly)
+    foreach ($s in @($rpcStream, $spamStream)) {
+        if ($s) { $meta.logStreamRestarts[(Split-Path $s.Path -Leaf)] = $s.Restarts }
     }
 
     $meta.endUtc                 = Get-UtcStamp
@@ -1319,15 +1498,14 @@ foreach ($run in $runs) {
         $meta.validatorRestartsAfter[$p] = Get-PodField $p '{.status.containerStatuses[0].restartCount}'
     }
 
-    # If a validator restarted mid-run, its stream ended with it: grab what we can
+    # A validator that restarted mid-run: its stream went on with the new container, so the
+    # old one's last lines (usually where an OOMKill shows) are only in --previous
     foreach ($p in $validatorPods) {
-        if (-not ($meta.logStreamDiedEarly[$p] -and $meta.logStartUtc)) { continue }
+        if (-not $meta.validatorRestartsBefore -or $null -eq $meta.validatorRestartsBefore[$p]) { continue }
+        if ($meta.validatorRestartsAfter[$p] -eq $meta.validatorRestartsBefore[$p]) { continue }
         $short = Get-ShortName $p
-        Write-Warning "$short log stream ended early; saving fallback copies."
-        Save-NativeOutput $kubectl @('logs', '-n', $ns, $p, "--since-time=$($meta.logStartUtc)") (Join-Path $runDir "$short-fallback.log")
-        if ($meta.validatorRestartsBefore -and $meta.validatorRestartsAfter[$p] -ne $meta.validatorRestartsBefore[$p]) {
-            Save-NativeOutput $kubectl @('logs', '-n', $ns, $p, '--previous') (Join-Path $runDir "$short-previous.log")
-        }
+        Write-Warning "$short restarted mid-run; saving its previous container's log."
+        Save-NativeOutput $kubectl @('logs', '-n', $ns, $p, '--previous') (Join-Path $runDir "$short-previous.log")
     }
     foreach ($f in @($valLogs.Values) + @($rpcLog, $spamLog)) { Remove-EmptyFile "$f.stderr" }
 

@@ -122,10 +122,23 @@ Most of these exist to work around Windows PowerShell 5.1:
 - **`Save-NativeOutput`** writes a command's output straight to a file. In 5.1, `>`
   re-encodes output as UTF-16, which doubles the size of large logs. Going through
   `Start-Process -RedirectStandardOutput` keeps the bytes as they are.
-- **`Start-LogStream` / `Stop-LogStream`** run `kubectl logs -f` as a background process
-  writing to a file, and stop it (optionally giving it a few seconds to end by itself
-  first, as it does when its container stops). Used for the validator logs, `rpc.log`
-  and `spamoor.log`.
+- **`Start-LogStream` / `Watch-LogStreams` / `Stop-LogStream`** run `kubectl logs -f` as
+  a background process writing to a file, keep it going, and stop it (optionally giving it
+  a few seconds to end by itself first, as it does when its container stops). Used for
+  the validator logs, `rpc.log` and `spamoor.log`.
+  - `kubectl logs -f` can end early on its own: in one 100k max-pending run every stream
+    ended at once with no pod restarts, leaving ~30% of the validators' `Produced` lines
+    and ~1% of spamoor's per-block lines. So while the script waits (warmup, load,
+    cooldown) it checks the streams every 2 s (`Wait-Streaming`). A stream that has
+    ended while its container is still running is restarted into `<log>.part<N>`, with
+    `--since-time` 10 s before it was last seen running, so nothing in between is lost.
+    At most one restart per stream per 10 s and 30 per run.
+  - `Stop-LogStream` appends the parts to the log. Each restart re-sends some lines
+    already saved, so it finds the last 3 lines saved before the restart in the first
+    64 MB of the part, and appends only what comes after them. If it can't find them
+    (e.g. a new container), the whole part is appended.
+  - A one-off `kubectl logs --since-time` at the end is no substitute: kubelet serves only
+    the current log file, so after rotation it misses everything before.
 - **`Get-PodField`** is a small `kubectl get pod -o jsonpath=…` wrapper. It returns
   `$null` on failure instead of throwing.
 - **`Reset-Network`** is the deliberate full-network restart (all 4 validators plus the
@@ -191,6 +204,7 @@ Most of these exist to work around Windows PowerShell 5.1:
      peering and the health check, even if the pod was restarted in between.
    - Streaming matters because kubelet rotates container logs, and a single
      `kubectl logs` at the end would lose the start of a long, noisy run.
+   - Streams that end early are restarted (see `Watch-LogStreams` under Helpers).
    - A 3-second sleep lets the streams attach before anything else happens.
 3. **Warmup**: after a reset or a fix-up restart, the network is left idle for
    `warmupSeconds` (see [Warmup](#warmup)).
@@ -359,8 +373,11 @@ Where each figure comes from:
 - **Per validator**: one line each, from that validator's own log: load blocks it
   proposed (`prop`, about 1 in 4 with 4 validators), the avg/p95 build time of those
   blocks and the % over the slot (same 2-minute cut as the table), its txpool max and at
-  load end (`pend`), restart count before → after the load (`RESTARTED MID-RUN` if it
-  changed or its log stream died), and its WARN/ERROR line counts. A validator whose log
+  load end (`pend`), restart count before → after the load (`RESTARTED MID-RUN` only if
+  it changed; a log stream ending on its own is not a restart), how many times its log
+  stream was restarted (`log stream restarted Nx`), or `LOG STREAM ENDED EARLY, log cut
+  short` if the stream had ended and couldn't be restarted, and its WARN/ERROR line
+  counts. A validator whose log
   is missing says `no log`. `validators.txt` has each validator's own timing table,
   pending avg/max/end and its five most common WARN/ERROR messages.
 - **Txpool pending**: the `N pending` in every `Produced`/`Imported` line (all Besu
@@ -373,6 +390,12 @@ Where each figure comes from:
   validator and its stuck pending count. The screen shows up to 3; `validators.txt` lists
   every one per validator. Adds `STALL x<n> (<blocks> blocks)` first in the table's notes.
   Load window only: after spamoor stops, empty blocks are expected.
+- **Log coverage**: each load block is produced by one validator, so `Produced lines for
+  N of M load blocks` should be (nearly) M. Under 90% (`$minLogCoveragePct`) a `!` line
+  says the validator logs have gaps and the build timings and txpool sizes are a partial
+  sample, and the table's notes say `validator logs N% of blocks`. The same check on
+  spamoor's per-block lines gives `spamoor log N% of blocks`. A line lists any log
+  streams that were restarted (`Log streams restarted ...`, note `log streams restarted`).
 - **CPU/memory**: `top.log` samples inside the load window, against the container limits
   in `meta.limits` (`-` if none). Memory limits are converted to Gi, so a decimal `2G`
   shows as `1.9Gi`. Any container whose max reaches 95% of a limit is marked `!` and
@@ -398,11 +421,18 @@ Where each figure comes from:
   `pending` is the low point and reads about one block of txs under the cap even when
   pinned; *in flight* (`pending + confirmed`) is the count just before the block, which
   is what hits the cap. A block counts as *at cap* when in flight is 95%+ of the cap
-  (`$spamCapPct`). The cap is `--max-pending` from `extraArgs`; without it, eoatx's
+  (`$spamCapPct`). In flight is shown as a % of the cap.
+  - The cap itself is hard: in spamoor v1.2.4, `scenario/txscenario.go` waits before
+    every send until fewer than `--max-pending` txs are unconfirmed.
+  - In flight can still read over 100%. spamoor confirms a block's txs, which frees
+    their slots, and its send loop refills them, all before it logs the block's line.
+    So `pending` already includes the refills, and `pending + confirmed` counts them
+    twice. The excess grows with block size (seen: +5% at 60k/6k tx/s, +40-50% at higher
+    rates). When it does go over, a line says so. *At cap* reads high by the same
+    effect, so compare it between runs at similar block sizes rather than as an absolute. The cap is `--max-pending` from `extraArgs`; without it, eoatx's
   default (spamoor v1.2.x) is worked out: 10 × `-t`, but at most 10 × wallets
   (`--max-wallets`, else 10 × `-t` up to 1,000). Other scenarios without `--max-pending`
-  show `cap unknown`. If in flight goes over the cap, the line says the cap is probably
-  wrong (different spamoor version or flags).
+  show `cap unknown`.
 - **spamoor failures**: a retry, or a pod not `Running` at load end, adds a line and a
   note. A load window cut short puts `SPAMOOR FAILED at <n> min` first in the notes.
 
@@ -428,15 +458,18 @@ group doesn't overwrite an earlier batch's table), and committed and pushed with
 
 - **`catch`** stores the error message in `meta.error`, and the loop continues.
 - **`finally`** always runs, including on Ctrl+C:
-  - `logStreamDiedEarly` (validator → true/false) is true for a validator whose
-    background kubectl had **already exited on its own**. That is the signal that the
-    validator restarted, since the stream dies with the container.
-  - `rpcLogStreamDiedEarly` is the same for `rpc.log` (the RPC node restarted).
-  - It then stops the streams, and deletes the spamoor pod if `$spamoorAlive` is still set.
-- **Fallback logs**: for each validator whose stream died, it saves
-  `--since-time=logStartUtc` logs from the current container as
-  `validator-<N>-fallback.log`. If that validator's restart count also changed, it saves
-  `--previous` as `validator-<N>-previous.log`, which is usually where an OOMKill shows up.
+  - It stops the streams (stitching in any restarted parts), and deletes the spamoor pod
+    if `$spamoorAlive` is still set.
+  - `logStreamDiedEarly` (validator → true/false) is true for a validator whose stream
+    had **ended on its own and not been restarted** by then, so its log is cut short.
+    `rpcLogStreamDiedEarly` is the same for `rpc.log`. `logStreamRestarts` (log file →
+    count) says how often each stream was restarted. None of these mean the pod
+    restarted; only the restart counts say that.
+- **Previous container's log**: for each validator whose restart count changed, it saves
+  `--previous` as `validator-<N>-previous.log`, which is usually where an OOMKill shows
+  up. The stream followed the new container, so its log has the rest. Runs before
+  2026-10-27 also have `validator-<N>-fallback.log` (a one-off `kubectl logs` taken when
+  a stream died; superseded by stream restarts).
 - **Results**: the run is written straight into its folder, `runs\[<group>\]<runId>\`,
   and `meta.json` is written last. With `-Zip` or `-Push` the folder is also zipped as
   `<runId>.zip` next to it. With `-Push`, a zip of at most `-MaxZipMB` is committed and

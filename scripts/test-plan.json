@@ -1,5 +1,5 @@
 {
-  "label": "upgrade bonsai - baseline with repeats 2",
+  "label": "--cache-last-blocks=2048",
   "image": "spamoor:v1.2.4",
   "namespace": "besu-consensus",
   "validatorPod": "besu-node-validator-1-0",
@@ -13,11 +13,10 @@
   "cooldownSeconds": 60,
   "sampleSeconds": 30,
   "runs": [
-    { "durationMinutes": 5, "throughput": 12000, "amount": 1, "extraArgs": ["--max-pending", "60000",  "--max-wallets", "100"] },
-    { "durationMinutes": 5, "throughput": 12000, "amount": 1, "extraArgs": ["--max-pending", "80000",  "--max-wallets", "100"] },
-    { "durationMinutes": 5, "throughput": 16000, "amount": 1, "extraArgs": ["--max-pending", "60000",  "--max-wallets", "100"] },
-    { "durationMinutes": 5, "throughput": 12000, "amount": 1, "extraArgs": ["--max-pending", "100000", "--max-wallets", "100"] },
-    { "durationMinutes": 5, "throughput": 16000, "amount": 1, "extraArgs": ["--max-pending", "80000",  "--max-wallets", "100"] },
-    { "durationMinutes": 5, "throughput": 12000, "amount": 1, "extraArgs": ["--max-pending", "60000",  "--max-wallets", "100"] }
+    { "durationMinutes": 5, "throughput": 12000, "amount": 1, "extraArgs": ["--max-pending", "60000", "--max-wallets", "100"] },
+    { "durationMinutes": 5, "throughput": 14000, "amount": 1, "extraArgs": ["--max-pending", "60000", "--max-wallets", "100"] },
+    { "durationMinutes": 5, "throughput": 12000, "amount": 1, "extraArgs": ["--max-pending", "80000", "--max-wallets", "100"] },
+    { "durationMinutes": 5, "throughput": 10000, "amount": 1, "extraArgs": ["--max-pending", "60000", "--max-wallets", "100"] },
+    { "durationMinutes": 5, "throughput": 12000, "amount": 1, "extraArgs": ["--max-pending", "60000", "--max-wallets", "100"] }
   ]
 }
