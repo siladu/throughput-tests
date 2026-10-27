@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Runs the spamoor load tests listed in test-plan.json. For each run it streams one
+    Runs the spamoor load tests listed in test-plan.json. For each run it streams every
     validator's logs, samples pod CPU/memory, runs spamoor for the set duration, lets the
     txpool drain, then zips everything into the repo's runs/ folder (and, with -Push,
     commits and pushes it).
@@ -433,17 +433,33 @@ function Get-Spread([double[]]$Values) {
     [pscustomobject]@{ Avg = ($s | Measure-Object -Average).Average; P50 = & $at 50; P95 = & $at 95; Max = $s[-1] }
 }
 
-# Besu's per-block 'Produced #N ...' / 'Imported #N ...' lines, keyed by block number. All
-# versions log the txpool size ('N pending'); newer ones add the proposer's build time
-# ('gas in 2.378s') and 'Timing(..., txsSelection=551ms, ...)'. Phase names are read from
-# the line rather than fixed, so phases added or renamed in later releases still show up.
-function Read-BlockLogLines([string]$Path) {
-    $entries = @{}
-    $phases  = New-Object System.Collections.Generic.List[string]   # in first-seen order
+# One pass over a Besu log: its per-block 'Produced #N ...' / 'Imported #N ...' lines,
+# keyed by block number, and its WARN/ERROR lines. All versions log the txpool size
+# ('N pending'); newer ones add the proposer's build time ('gas in 2.378s') and
+# 'Timing(..., txsSelection=551ms, ...)'. Phase names are read from the line rather than
+# fixed, so phases added or renamed in later releases still show up. Returns Entries,
+# Phases, Warn, Error and Messages (WARN/ERROR message -> count, with numbers and hashes
+# blanked so repeats group together).
+function Read-BesuLog([string]$Path) {
+    $entries  = @{}
+    $phases   = New-Object System.Collections.Generic.List[string]   # in first-seen order
+    $messages = @{}
+    $warn     = 0
+    $err      = 0
+    $level    = [regex]'\b(WARN|ERROR)\b'
     foreach ($l in [IO.File]::ReadLines($Path)) {
-        if (-not $l.Contains(' pending')) { continue }
+        $isBlock = $l.Contains(' pending')
+        if (-not ($isBlock -or $l.Contains('WARN') -or $l.Contains('ERROR'))) { continue }
         $l = $l -replace $ansiEscape, ''   # Besu colours its console log; 'ESC[32mProduced' has no \b
-        if ($l -cnotmatch '\b(Produced|Imported)\b[^#]*#(\d[\d,.]*)') { continue }
+        $m = $level.Match($l)
+        if ($m.Success) {
+            if ($m.Groups[1].Value -eq 'WARN') { $warn++ } else { $err++ }
+            $msg = $m.Value + ' ' + ($l.Substring($m.Index + $m.Length) -replace '^[\s|]+', '' -replace '0x[0-9a-fA-F]+', '0x..' -replace '\d+', 'N')
+            if ($msg.Length -gt 110) { $msg = $msg.Substring(0, 110) }
+            $messages[$msg] = 1 + [int]$messages[$msg]
+            continue
+        }
+        if (-not $isBlock -or $l -cnotmatch '\b(Produced|Imported)\b[^#]*#(\d[\d,.]*)') { continue }
         $kind = $Matches[1]
         $num  = [long]($Matches[2] -replace '\D', '')
         if ($kind -eq 'Imported' -and $entries[$num] -and $entries[$num].Kind -eq 'Produced') { continue }
@@ -453,94 +469,190 @@ function Read-BlockLogLines([string]$Path) {
             if ($l -match '\sin\s+([\d.]+\s*m?s)\b') { $e.Total = 1000 * (ConvertTo-Seconds $Matches[1]) }
             if ($l -match 'Timing\(([^)]*)\)') {
                 $e.Phases = [ordered]@{}
-                foreach ($m in [regex]::Matches($Matches[1], '(\w+)=([\d.]+\s*m?s)\b')) {
-                    $name = $m.Groups[1].Value
-                    $e.Phases[$name] = 1000 * (ConvertTo-Seconds $m.Groups[2].Value)
+                foreach ($pm in [regex]::Matches($Matches[1], '(\w+)=([\d.]+\s*m?s)\b')) {
+                    $name = $pm.Groups[1].Value
+                    $e.Phases[$name] = 1000 * (ConvertTo-Seconds $pm.Groups[2].Value)
                     if (-not $phases.Contains($name)) { $phases.Add($name) }
                 }
             }
         }
         $entries[$num] = $e
     }
-    return @{ Entries = $entries; Phases = $phases.ToArray() }
+    return @{ Entries = $entries; Phases = $phases.ToArray(); Warn = $warn; Error = $err; Messages = $messages }
 }
 
-# Build timings of the load blocks the logged validator proposed (about 1 in 4 with 4
-# validators), and its txpool size after each load block. Timings are from $SteadyFrom
-# (unix time) on if given, with the untrimmed figures alongside. Returns Lines and the
-# batch table's BuildMs (avg/p95), OverSlot and MaxPending.
-function Get-BlockLogSummary($Load, $SteadyFrom, [string]$LogPath) {
-    $lines = New-Object System.Collections.Generic.List[string]
-    $out   = @{ Lines = $lines; BuildMs = ''; OverSlot = ''; MaxPending = '' }
-    $log   = Read-BlockLogLines $LogPath
-    $who   = Get-ShortName $validatorPod
-    $inLoad = @(foreach ($b in $Load) {
-        $e = $log.Entries[$b.Number]
-        if ($e) { [pscustomobject]@{ Time = $b.Time; E = $e } }
-    })
-    $produced = @($inLoad | Where-Object { $_.E.Kind -eq 'Produced' })
-    $timed    = @($produced | Where-Object { $null -ne $_.E.Total -or $_.E.Phases })
-    $head     = "Block production ($who proposed $($produced.Count) of $($Load.Count) load blocks)"
-    if ($produced.Count -eq 0) {
-        $lines.Add('Block production: no Produced lines for load blocks in validator.log')
-    } elseif ($timed.Count -eq 0) {
-        $lines.Add("$head; no build timings in its log (older Besu)")
-    } else {
-        $steady = $timed
-        $label  = "ms, whole load ($($timed.Count) blocks)"
-        if ($SteadyFrom) {
-            $s = @($timed | Where-Object { $_.Time -ge $SteadyFrom })
-            if ($s.Count -gt 0) { $steady = $s; $label = "ms, after first 2 min ($($s.Count) blocks)" }
-        }
-        $totals = @($steady | Where-Object { $null -ne $_.E.Total } | ForEach-Object { $_.E.Total })
-        $rows = @()
-        if ($totals.Count -gt 0) { $rows += , @('total', $totals) }
-        $zero = @()
-        foreach ($p in $log.Phases) {
-            $v = @($steady | Where-Object { $_.E.Phases -and $_.E.Phases.Contains($p) } | ForEach-Object { $_.E.Phases[$p] })
-            if ($v.Count -eq 0) { continue }
-            if (($v | Measure-Object -Maximum).Maximum -eq 0) { $zero += $p; continue }
-            $name = $p
-            if ($timingSubPhases -contains $p) { $name = "  $p" }
-            $rows += , @($name, $v)
-        }
-        $w = 2 + [Math]::Max($label.Length, [int]($rows | ForEach-Object { $_[0].Length } | Measure-Object -Maximum).Maximum)
-        $lines.Add("${head}:")
-        $lines.Add('  ' + $label.PadRight($w) + ('{0,7}{1,7}{2,7}{3,7}' -f 'avg', 'p50', 'p95', 'max'))
-        foreach ($r in $rows) {
-            $sp = Get-Spread $r[1]
-            $lines.Add('  ' + $r[0].PadRight($w) + ('{0,7:N0}{1,7:N0}{2,7:N0}{3,7:N0}' -f $sp.Avg, $sp.P50, $sp.P95, $sp.Max))
-        }
-        if ($zero.Count -gt 0) { $lines.Add('  0 ms throughout: ' + ($zero -join ', ')) }
-        if ($totals.Count -gt 0) {
-            $slotMs = 1000 * (ConvertTo-Seconds $plan.slotDuration)
-            $sp     = Get-Spread $totals
-            $over   = @($totals | Where-Object { $_ -gt $slotMs }).Count
-            $msg    = '  over {0} slot: {1} of {2} ({3:N0}%)' -f $plan.slotDuration, $over, $totals.Count, (100.0 * $over / $totals.Count)
-            $all    = @($timed | Where-Object { $null -ne $_.E.Total } | ForEach-Object { $_.E.Total })
-            if ($all.Count -ne $totals.Count) {
-                $spAll = Get-Spread $all
-                $msg += '; untrimmed total avg {0:N0}, p95 {1:N0}, over slot {2} of {3}' -f $spAll.Avg, $spAll.P95, @($all | Where-Object { $_ -gt $slotMs }).Count, $all.Count
-            }
-            $lines.Add($msg)
-            $out.BuildMs  = '{0:N0}/{1:N0}' -f $sp.Avg, $sp.P95
-            $out.OverSlot = '{0:N0}%' -f (100.0 * $over / $totals.Count)
-        }
+# Build-time table (total and each Timing phase) over $Timed (Time + E, a Read-BesuLog
+# entry), from $SteadyFrom (unix time) on if given, with the untrimmed total alongside.
+# Returns Lines, and Avg, P95 and OverPct of the total ($null if no block logged one).
+function Get-BuildTimingTable($Timed, [string[]]$Phases, $SteadyFrom, [string]$Head) {
+    $lines  = New-Object System.Collections.Generic.List[string]
+    $out    = @{ Lines = $lines; Avg = $null; P95 = $null; OverPct = $null }
+    $steady = $Timed
+    $label  = "ms, whole load ($($Timed.Count) blocks)"
+    if ($SteadyFrom) {
+        $s = @($Timed | Where-Object { $_.Time -ge $SteadyFrom })
+        if ($s.Count -gt 0) { $steady = $s; $label = "ms, after first 2 min ($($s.Count) blocks)" }
     }
-    $pend = @($inLoad | Where-Object { $null -ne $_.E.Pending })
-    if ($pend.Count -gt 0) {
-        $pm = $pend | ForEach-Object { $_.E.Pending } | Measure-Object -Average -Maximum
-        $lines.Add(('Txpool pending on {0} ({1} of {2} load blocks): avg {3:N0}, max {4:N0}, at load end {5:N0}' -f
-                $who, $pend.Count, $Load.Count, $pm.Average, $pm.Maximum, $pend[-1].E.Pending))
-        $out.MaxPending = '{0:N0}' -f $pm.Maximum
+    $totals = @($steady | Where-Object { $null -ne $_.E.Total } | ForEach-Object { $_.E.Total })
+    $rows = @()
+    if ($totals.Count -gt 0) { $rows += , @('total', $totals) }
+    $zero = @()
+    foreach ($p in $Phases) {
+        $v = @($steady | Where-Object { $_.E.Phases -and $_.E.Phases.Contains($p) } | ForEach-Object { $_.E.Phases[$p] })
+        if ($v.Count -eq 0) { continue }
+        if (($v | Measure-Object -Maximum).Maximum -eq 0) { $zero += $p; continue }
+        $name = $p
+        if ($timingSubPhases -contains $p) { $name = "  $p" }
+        $rows += , @($name, $v)
+    }
+    $w = 2 + [Math]::Max($label.Length, [int]($rows | ForEach-Object { $_[0].Length } | Measure-Object -Maximum).Maximum)
+    $lines.Add("${Head}:")
+    $lines.Add('  ' + $label.PadRight($w) + ('{0,7}{1,7}{2,7}{3,7}' -f 'avg', 'p50', 'p95', 'max'))
+    foreach ($r in $rows) {
+        $sp = Get-Spread $r[1]
+        $lines.Add('  ' + $r[0].PadRight($w) + ('{0,7:N0}{1,7:N0}{2,7:N0}{3,7:N0}' -f $sp.Avg, $sp.P50, $sp.P95, $sp.Max))
+    }
+    if ($zero.Count -gt 0) { $lines.Add('  0 ms throughout: ' + ($zero -join ', ')) }
+    if ($totals.Count -gt 0) {
+        $slotMs = 1000 * (ConvertTo-Seconds $plan.slotDuration)
+        $sp     = Get-Spread $totals
+        $over   = @($totals | Where-Object { $_ -gt $slotMs }).Count
+        $msg    = '  over {0} slot: {1} of {2} ({3:N0}%)' -f $plan.slotDuration, $over, $totals.Count, (100.0 * $over / $totals.Count)
+        $all    = @($Timed | Where-Object { $null -ne $_.E.Total } | ForEach-Object { $_.E.Total })
+        if ($all.Count -ne $totals.Count) {
+            $spAll = Get-Spread $all
+            $msg += '; untrimmed total avg {0:N0}, p95 {1:N0}, over slot {2} of {3}' -f $spAll.Avg, $spAll.P95, @($all | Where-Object { $_ -gt $slotMs }).Count, $all.Count
+        }
+        $lines.Add($msg)
+        $out.Avg     = $sp.Avg
+        $out.P95     = $sp.P95
+        $out.OverPct = 100.0 * $over / $totals.Count
     }
     return $out
 }
 
-# Summarises a finished run from the chain (RPC on the logged validator), top.log and the
-# logs. Returns Lines (printed and saved as summary.txt) and Row (end-of-batch table).
+# Every validator's log (<validator>.log): build timings of the load blocks, pooled across
+# the validators that proposed them, then one line per validator (its own blocks' timings,
+# its txpool size after each load block, restarts, WARN/ERROR counts) and the most common
+# WARN/ERROR messages across all of them. Each validator's own timing table and messages
+# go in Detail (validators.txt). Timings are from $SteadyFrom (unix time) on if given.
+# $Load may be empty (no load phase): restarts and log warnings are still reported.
+# Returns Lines, Detail, Notes and the batch table's BuildMs (avg/p95), OverSlot and MaxPending.
+function Get-ValidatorSummary($Load, $SteadyFrom, $Meta, [string]$RunDir) {
+    $lines  = New-Object System.Collections.Generic.List[string]
+    $detail = New-Object System.Collections.Generic.List[string]
+    $out    = @{ Lines = $lines; Detail = $detail; Notes = @(); BuildMs = ''; OverSlot = ''; MaxPending = '' }
+    $logs   = [ordered]@{}   # validator -> Read-BesuLog, for those with a log
+    foreach ($pod in $Meta.validatorPods) {
+        $path = Join-Path $RunDir "$(Get-ShortName $pod).log"
+        if (Test-Path $path) { $logs[$pod] = Read-BesuLog $path }
+    }
+    $phases = @($logs.Values | ForEach-Object { $_.Phases } | Select-Object -Unique)
+
+    # Each load block's Produced line, from whichever validator proposed it
+    $produced = @(foreach ($b in $Load) {
+        foreach ($pod in $logs.Keys) {
+            $e = $logs[$pod].Entries[$b.Number]
+            if ($e -and $e.Kind -eq 'Produced') { [pscustomobject]@{ Time = $b.Time; E = $e; Pod = $pod }; break }
+        }
+    })
+    $timed = @($produced | Where-Object { $null -ne $_.E.Total -or $_.E.Phases })
+    if ($Load.Count -ge 2) {
+        $head = "Block production (all validators; Produced lines for $($produced.Count) of $($Load.Count) load blocks)"
+        if ($produced.Count -eq 0) {
+            $lines.Add('Block production: no Produced lines for load blocks in the validator logs')
+        } elseif ($timed.Count -eq 0) {
+            $lines.Add("$head; no build timings in the logs (older Besu)")
+        } else {
+            $t = Get-BuildTimingTable $timed $phases $SteadyFrom $head
+            foreach ($l in $t.Lines) { $lines.Add($l) }
+            if ($null -ne $t.Avg) {
+                $out.BuildMs  = '{0:N0}/{1:N0}' -f $t.Avg, $t.P95
+                $out.OverSlot = '{0:N0}%' -f $t.OverPct
+            }
+        }
+    }
+
+    $before = $Meta.validatorRestartsBefore
+    if (-not $before) { $before = @{} }
+    $after = $Meta.validatorRestartsAfter
+    if (-not $after) { $after = @{} }
+    $died = $Meta.logStreamDiedEarly
+    if (-not $died) { $died = @{} }
+    if ($logs.Count -eq 0 -and $before.Count -eq 0) {
+        $lines.Add('No validator logs.')   # abandoned before the streams started
+        return $out
+    }
+    $lines.Add('Per validator (more in validators.txt; prop = load blocks proposed, build = ms avg/p95, pend = txpool max/at load end):')
+    $maxPend = $null
+    foreach ($pod in $Meta.validatorPods) {
+        $short = Get-ShortName $pod
+        $detail.Add("--- $short ---")
+        $rs = "restarts $($before[$pod])->$($after[$pod])"
+        if (($null -ne $before[$pod] -and $before[$pod] -ne $after[$pod]) -or $died[$pod]) {
+            $rs += ' RESTARTED MID-RUN'
+            $out.Notes += "$short restarted"
+        }
+        $log = $logs[$pod]
+        if (-not $log) {
+            $lines.Add(('  {0,-12} no log; {1}' -f $short, $rs))
+            $detail.Add("No log; $rs")
+            continue
+        }
+        $parts = @()
+        if ($Load.Count -ge 2) {
+            $own      = @($produced | Where-Object { $_.Pod -eq $pod })
+            $ownTimed = @($timed | Where-Object { $_.Pod -eq $pod })
+            $ownHead  = "Block production ($short proposed $($own.Count) of $($Load.Count) load blocks)"
+            $parts   += "prop $($own.Count)"
+            if ($ownTimed.Count -gt 0) {
+                $t = Get-BuildTimingTable $ownTimed $phases $SteadyFrom $ownHead
+                foreach ($l in $t.Lines) { $detail.Add($l) }
+                if ($null -ne $t.Avg) { $parts += 'build {0:N0}/{1:N0} over {2:N0}%' -f $t.Avg, $t.P95, $t.OverPct }
+            } else {
+                $detail.Add("$ownHead; no build timings")
+            }
+            $pend = @(foreach ($b in $Load) {
+                $e = $log.Entries[$b.Number]
+                if ($e -and $null -ne $e.Pending) { $e.Pending }
+            })
+            if ($pend.Count -gt 0) {
+                $pm = $pend | Measure-Object -Average -Maximum
+                $parts += 'pend {0:N0}/{1:N0}' -f $pm.Maximum, $pend[-1]
+                $detail.Add(('Txpool pending ({0} of {1} load blocks): avg {2:N0}, max {3:N0}, at load end {4:N0}' -f
+                        $pend.Count, $Load.Count, $pm.Average, $pm.Maximum, $pend[-1]))
+                if (-not $maxPend -or $pm.Maximum -gt $maxPend.Value) { $maxPend = @{ Value = $pm.Maximum; Pod = $short } }
+            }
+        }
+        $parts += $rs
+        $parts += "WARN $($log.Warn) ERROR $($log.Error)"
+        $lines.Add(('  {0,-12} {1}' -f $short, ($parts -join '; ')))
+        $detail.Add("$rs; WARN $($log.Warn), ERROR $($log.Error) (whole run)")
+        $log.Messages.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5 |
+            ForEach-Object { $detail.Add(('  {0,5} x {1}' -f $_.Value, $_.Key)) }
+    }
+    if ($maxPend) { $out.MaxPending = '{0:N0} {1}' -f $maxPend.Value, $maxPend.Pod }
+
+    # Most common WARN/ERROR messages across every validator's log
+    $all = @{}
+    foreach ($log in $logs.Values) {
+        foreach ($k in $log.Messages.Keys) { $all[$k] = $log.Messages[$k] + [int]$all[$k] }
+    }
+    if ($all.Count -gt 0) {
+        $lines.Add('Most common WARN/ERROR across validator logs (whole run):')
+        $all.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 3 |
+            ForEach-Object { $lines.Add(('  {0,5} x {1}' -f $_.Value, $_.Key)) }
+    }
+    return $out
+}
+
+# Summarises a finished run from the chain (RPC on $validatorPod), top.log and the logs.
+# Returns Lines (printed and saved as summary.txt), Detail (validators.txt) and Row
+# (end-of-batch table).
 function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     $lines  = New-Object System.Collections.Generic.List[string]
+    $load       = @()
+    $steadyFrom = $null
     $reqTps = [double]$Run.throughput / (ConvertTo-Seconds $plan.slotDuration)
     $extra  = @($Run.extraArgs | Where-Object { $_ }) -join ' '
     $row    = [ordered]@{
@@ -555,11 +667,9 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
     $lines.Add("spamoor $($plan.scenario) --slot-duration $($plan.slotDuration) -t $($Run.throughput) --amount $($Run.amount) $extra".TrimEnd())
 
     # Blocks and transactions, from the chain
-    $valLog = Join-Path $RunDir 'validator.log'
     if ($Meta.loadStartUtc -and $Meta.loadEndUtc) {
         $ls = ConvertTo-Unix $Meta.loadStartUtc
         $le = ConvertTo-Unix $Meta.loadEndUtc
-        $load = @()
         try {
             $pf = Start-Forward $validatorPod $summaryPort
             try { $blocks = Get-BlocksSince $summaryPort $ls } finally { Stop-Process -Id $pf.Id -Force }
@@ -619,22 +729,24 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
             $lines.Add("Block stats unavailable: $_")
             $notes += 'no block stats'
         }
-        # Build timings and txpool size, from validator.log
-        if ($load.Count -ge 2 -and (Test-Path $valLog)) {
-            try {
-                $steadyFrom = $null
-                if ($secs -gt 180) { $steadyFrom = $ls + 120 }
-                $bl = Get-BlockLogSummary $load $steadyFrom $valLog
-                foreach ($l in $bl.Lines) { $lines.Add($l) }
-                $row.'Build ms'  = $bl.BuildMs
-                $row.'Over slot' = $bl.OverSlot
-                $row.'Max pending' = $bl.MaxPending
-            } catch {
-                $lines.Add("Block production stats unavailable: $_")
-            }
-        }
+        if ($load.Count -ge 2 -and $secs -gt 180) { $steadyFrom = $ls + 120 }
     } else {
         $lines.Add('No load phase (see error below).')
+    }
+
+    # Build timings, txpool size, restarts and warnings, from every validator's log
+    $detail = @()
+    try {
+        $v = Get-ValidatorSummary $load $steadyFrom $Meta $RunDir
+        foreach ($l in $v.Lines) { $lines.Add($l) }
+        $detail = $v.Detail.ToArray()
+        $notes += $v.Notes
+        $row.'Build ms'    = $v.BuildMs
+        $row.'Over slot'   = $v.OverSlot
+        $row.'Max pending' = $v.MaxPending
+    } catch {
+        $lines.Add("Validator log stats unavailable: $_")
+        $notes += 'no validator stats'
     }
 
     # Health before load
@@ -703,26 +815,6 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
         }
     }
 
-    # Restarts and log warnings/errors
-    $restart = "validator restarts $($Meta.validatorRestartsBefore) -> $($Meta.validatorRestartsAfter)"
-    if ($Meta.validatorRestartsBefore -ne $Meta.validatorRestartsAfter -or $Meta.logStreamDiedEarly) {
-        $restart += ' (RESTARTED MID-RUN)'
-        $notes += 'validator restarted'
-    }
-    if (Test-Path $valLog) {
-        $hits = @(Select-String -Path $valLog -Pattern "(?:$ansiEscape|\b)(WARN|ERROR)\b" -CaseSensitive)
-        $warn = @($hits | Where-Object { $_.Matches[0].Groups[1].Value -eq 'WARN' }).Count
-        $lines.Add("$restart; validator.log WARN $warn, ERROR $($hits.Count - $warn)")
-        # Most common messages, with numbers and hashes blanked so repeats group together
-        $common = $hits | ForEach-Object {
-            $m = $_.Matches[0]
-            $msg = $m.Value + ' ' + ($_.Line.Substring($m.Index + $m.Length) -replace '^[\s|]+', '' -replace '0x[0-9a-fA-F]+', '0x..' -replace '\d+', 'N')
-            if ($msg.Length -gt 110) { $msg.Substring(0, 110) } else { $msg }
-        } | Group-Object | Sort-Object Count -Descending | Select-Object -First 3
-        foreach ($g in $common) { $lines.Add(('  {0,5} x {1}' -f $g.Count, $g.Name)) }
-    } else {
-        $lines.Add($restart)
-    }
     # spamoor: did it run the whole window, and what did it complain about
     foreach ($f in @($Meta.spamoorFailures)) {
         if (-not $f) { continue }
@@ -767,7 +859,7 @@ function Get-RunSummary($Run, $Meta, [string]$RunDir) {
         $notes = @('ERROR') + $notes
     }
     $row.Notes = $notes -join '; '
-    return @{ Lines = $lines.ToArray(); Row = [pscustomobject]$row }
+    return @{ Lines = $lines.ToArray(); Detail = $detail; Row = [pscustomobject]$row }
 }
 
 # Commits just the given zip (not anything else under runs\, such as unzipped copies)
@@ -803,7 +895,6 @@ function Publish-Run([string]$ZipPath, [string]$Message) {
 $plan            = Get-Content $PlanFile -Raw | ConvertFrom-Json
 $runs            = @($plan.runs)
 $ns              = $plan.namespace
-$validatorPod    = $plan.validatorPod
 $cooldownSeconds = [int]$plan.cooldownSeconds
 $warmupSeconds   = [int]$plan.warmupSeconds
 $sampleSeconds   = [int]$plan.sampleSeconds
@@ -851,6 +942,16 @@ if ($besuPods -notcontains $rpcPod) {
     $rpcPod = $null
 }
 
+# Every validator's log is streamed and summarised. The summary reads blocks over RPC
+# from the plan's validatorPod, or the first validator.
+$validatorPods = @($besuPods | Where-Object { $_ -match 'validator' })
+if ($validatorPods.Count -eq 0) { throw "No validator pods (Besu pods named *validator*) found in $ns." }
+$validatorPod = $plan.validatorPod
+if ($validatorPods -notcontains $validatorPod) {
+    if ($validatorPod) { Write-Warning "validatorPod '$validatorPod' isn't a validator pod in $ns; reading blocks from $($validatorPods[0])." }
+    $validatorPod = $validatorPods[0]
+}
+
 # Static peers, from the configmap every Besu pod mounts. The pod name is the first label
 # of each enode's host; the public key maps admin_peers results back to pods.
 $staticJson = (Invoke-Native $kubectl @('get', 'configmap', $peersConfigMap, '-n', $ns,
@@ -881,6 +982,7 @@ $loadMinutes = ($runs | Measure-Object -Property durationMinutes -Sum).Sum
 Write-Host "$($runs.Count) runs, $loadMinutes min of load plus setup/cooldown per run."
 Write-Host "Network reset before each run: $doReset. Results go to $runsDir."
 Write-Host "Health check covers: $($besuPods -join ', ')"
+Write-Host "Validator logs: $($validatorPods -join ', ')"
 
 # Remove leftover spamoor pods, including the original hand-made 'spamoor' pod
 Invoke-Native $kubectl @('delete', 'pod', '-n', $ns, '-l', 'app=spamoor', '--ignore-not-found', '--wait=true') | Out-Null
@@ -927,19 +1029,21 @@ foreach ($run in $runs) {
         amount          = $run.amount
         spamoorArgs     = @($spamoorArgs | ForEach-Object { if ($_ -eq $privKey) { '<redacted>' } else { $_ } })
         resetNetwork    = $doReset
-        validatorPod    = $validatorPod
+        validatorPods   = $validatorPods
+        validatorPod    = $validatorPod                                # the summary reads blocks from this one
     }
 
-    $valLog       = Join-Path $runDir 'validator.log'
+    $valLogs      = [ordered]@{}   # validator -> <validator>.log
+    foreach ($p in $validatorPods) { $valLogs[$p] = Join-Path $runDir "$(Get-ShortName $p).log" }
     $rpcLog       = Join-Path $runDir 'rpc.log'
     $spamLog      = Join-Path $runDir 'spamoor.log'
-    $logProc      = $null
+    $logProcs     = @{}            # validator -> its log stream
     $rpcLogProc   = $null
     $spamLogProc  = $null
     $spamoorAlive = $false
 
     try {
-        # validator.log covers everything from here: reset, health check, warmup, load, cooldown
+        # The validator logs cover everything from here: reset, health check, warmup, load, cooldown
         $meta.logStartUtc = Get-UtcStamp
 
         # 1. Get to a healthy network: optional full restart, then wait for peers and
@@ -948,12 +1052,16 @@ foreach ($run in $runs) {
         $meta.health     = Confirm-NetworkHealthy $runDir $meta.logStartUtc
         $meta.healthyUtc = Get-UtcStamp
 
-        $meta.validatorNode           = Get-PodField $validatorPod '{.spec.nodeName}'
-        $meta.validatorRestartsBefore = Get-PodField $validatorPod '{.status.containerStatuses[0].restartCount}'
+        $meta.validatorNodes          = [ordered]@{}
+        $meta.validatorRestartsBefore = [ordered]@{}
+        foreach ($p in $validatorPods) {
+            $meta.validatorNodes[$p]          = Get-PodField $p '{.spec.nodeName}'
+            $meta.validatorRestartsBefore[$p] = Get-PodField $p '{.status.containerStatuses[0].restartCount}'
+        }
 
-        # 2. Stream the validator's and the RPC node's logs. --since-time backfills the reset
+        # 2. Stream every validator's and the RPC node's logs. --since-time backfills the reset
         #    and health check, including the startup of a container restarted since then.
-        $logProc = Start-LogStream $validatorPod $valLog $meta.logStartUtc
+        foreach ($p in $validatorPods) { $logProcs[$p] = Start-LogStream $p $valLogs[$p] $meta.logStartUtc }
         if ($rpcPod) { $rpcLogProc = Start-LogStream $rpcPod $rpcLog $meta.logStartUtc }
         Start-Sleep -Seconds 3
 
@@ -1040,9 +1148,10 @@ foreach ($run in $runs) {
         Write-Warning "Run $runId hit an error: $_"
     }
     finally {
-        $meta.logStreamDiedEarly    = [bool]($logProc -and $logProc.HasExited)
+        $meta.logStreamDiedEarly = [ordered]@{}   # validator -> its stream had ended by itself
+        foreach ($p in $validatorPods) { $meta.logStreamDiedEarly[$p] = [bool]($logProcs[$p] -and $logProcs[$p].HasExited) }
         $meta.rpcLogStreamDiedEarly = [bool]($rpcLogProc -and $rpcLogProc.HasExited)
-        Stop-LogStream $logProc
+        foreach ($proc in $logProcs.Values) { Stop-LogStream $proc }
         Stop-LogStream $rpcLogProc
         if ($spamoorAlive) {
             Invoke-Native $kubectl @('delete', 'pod', $podName, '-n', $ns, '--ignore-not-found', "--grace-period=$spamoorGraceSeconds", '--wait=true') -AllowFailure | Out-Null
@@ -1051,17 +1160,22 @@ foreach ($run in $runs) {
     }
 
     $meta.endUtc                 = Get-UtcStamp
-    $meta.validatorRestartsAfter = Get-PodField $validatorPod '{.status.containerStatuses[0].restartCount}'
+    $meta.validatorRestartsAfter = [ordered]@{}
+    foreach ($p in $validatorPods) {
+        $meta.validatorRestartsAfter[$p] = Get-PodField $p '{.status.containerStatuses[0].restartCount}'
+    }
 
-    # If the validator restarted mid-run, the stream ended with it: grab what we can
-    if ($meta.logStreamDiedEarly -and $meta.logStartUtc) {
-        Write-Warning 'Validator log stream ended early; saving fallback copies.'
-        Save-NativeOutput $kubectl @('logs', '-n', $ns, $validatorPod, "--since-time=$($meta.logStartUtc)") (Join-Path $runDir 'validator-fallback.log')
-        if ($meta.validatorRestartsAfter -ne $meta.validatorRestartsBefore) {
-            Save-NativeOutput $kubectl @('logs', '-n', $ns, $validatorPod, '--previous') (Join-Path $runDir 'validator-previous.log')
+    # If a validator restarted mid-run, its stream ended with it: grab what we can
+    foreach ($p in $validatorPods) {
+        if (-not ($meta.logStreamDiedEarly[$p] -and $meta.logStartUtc)) { continue }
+        $short = Get-ShortName $p
+        Write-Warning "$short log stream ended early; saving fallback copies."
+        Save-NativeOutput $kubectl @('logs', '-n', $ns, $p, "--since-time=$($meta.logStartUtc)") (Join-Path $runDir "$short-fallback.log")
+        if ($meta.validatorRestartsBefore -and $meta.validatorRestartsAfter[$p] -ne $meta.validatorRestartsBefore[$p]) {
+            Save-NativeOutput $kubectl @('logs', '-n', $ns, $p, '--previous') (Join-Path $runDir "$short-previous.log")
         }
     }
-    foreach ($f in @($valLog, $rpcLog, $spamLog)) { Remove-EmptyFile "$f.stderr" }
+    foreach ($f in @($valLogs.Values) + @($rpcLog, $spamLog)) { Remove-EmptyFile "$f.stderr" }
 
     # Summary for the console (results don't come back through git), summary.txt and meta.json
     Write-Host '  Summarising (reads the run''s blocks over RPC) ...'
@@ -1072,6 +1186,9 @@ foreach ($run in $runs) {
         Write-Host ''
         $summary.Lines | ForEach-Object { Write-Host "  $_" }
         $summary.Lines | Set-Content -Path (Join-Path $runDir 'summary.txt') -Encoding UTF8
+        if ($summary.Detail.Count -gt 0) {
+            $summary.Detail | Set-Content -Path (Join-Path $runDir 'validators.txt') -Encoding UTF8
+        }
     } catch {
         Write-Warning "Couldn't summarise ${runId}: $_"
         $summaryRows += [pscustomobject]@{ Run = $runName; Notes = "summary failed: $_" }
@@ -1094,7 +1211,7 @@ foreach ($run in $runs) {
     }
 }
 
-$batchTitle = "=== Batch summary: $($summaryRows.Count) run(s), load window only; 2m+ excludes the first 2 min; Build ms (avg/p95) and Over slot: the logged validator's own blocks, 2m+ ==="
+$batchTitle = "=== Batch summary: $($summaryRows.Count) run(s), load window only; 2m+ excludes the first 2 min; Build ms (avg/p95) and Over slot: every validator's blocks, 2m+ ==="
 $batchTable = $summaryRows | Format-Table -AutoSize -Property Run, 'Req tx/s', 'Tx/s', 'Tx/s 2m+', 'Tx/blk', 'Max tx/blk', 'Mgas/s', 'Gas %', 'Blk s', 'Max gap s', 'Build ms', 'Over slot', 'Max pending', 'Besu CPU', 'Besu mem', 'Extra args', Notes |
     Out-String -Width 300
 Write-Host "`n$batchTitle"

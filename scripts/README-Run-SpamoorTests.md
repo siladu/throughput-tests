@@ -1,7 +1,7 @@
 # Run-SpamoorTests.ps1
 
 Runs every load test listed in `test-plan.json`, one after another. For each run it
-captures the validator's logs and CPU/memory samples, then zips the results into `runs/`
+captures every validator's logs and CPU/memory samples, then zips the results into `runs/`
 and, with `-Push`, commits and pushes them. It runs on the VDS under Windows PowerShell 5.1.
 
 The VDS currently can't push to GitHub, so leave `-Push` off there; the console output
@@ -32,8 +32,8 @@ After the last run it prints a table comparing all runs in the batch. See
 Each run is wrapped so that a failure is written into that run's `meta.json` and the loop
 moves on to the next run.
 
-Timeline of one run and the `meta.json` timestamps. `validator.log` and `rpc.log` cover
-all of it, from `logStartUtc` to `endUtc`:
+Timeline of one run and the `meta.json` timestamps. The validator logs
+(`validator-<N>.log`) and `rpc.log` cover all of it, from `logStartUtc` to `endUtc`:
 
 ```
 logStartUtc ──┬─ ... reset (if enabled), health check, fix-ups ...
@@ -92,6 +92,11 @@ All parameters have defaults.
 | `healthTimeoutSeconds` | 300 | How long one health wait lasts before a fix-up (or giving up) |
 | `maxFixups` | 2 | Fix-ups (full reset or single-pod restart) allowed per run before the run is abandoned |
 | `rpcPod` | first label of `rpcUrl`'s host | Pod whose log is streamed as `rpc.log` (the node spamoor sends to) |
+| `validatorPod` | first validator | Validator the summary reads blocks from over RPC. Every validator's log is streamed whatever this says |
+
+Validators are the Besu pods whose name contains `validator`, found once at startup and
+printed. Each one's log is saved as `<name>.log`, where `<name>` is the pod name without
+the `besu-node-` prefix and `-0` suffix (`validator-1.log` … `validator-4.log`).
 
 Fixed in the script: every pod must be connected to every other running pod in the
 `besu-peers` configmap, the chain must advance 5 blocks, each pod must be within 2 blocks
@@ -113,8 +118,8 @@ Most of these exist to work around Windows PowerShell 5.1:
   `Start-Process -RedirectStandardOutput` keeps the bytes as they are.
 - **`Start-LogStream` / `Stop-LogStream`** run `kubectl logs -f` as a background process
   writing to a file, and stop it (optionally giving it a few seconds to end by itself
-  first, as it does when its container stops). Used for `validator.log`, `rpc.log` and
-  `spamoor.log`.
+  first, as it does when its container stops). Used for the validator logs, `rpc.log`
+  and `spamoor.log`.
 - **`Get-PodField`** is a small `kubectl get pod -o jsonpath=…` wrapper. It returns
   `$null` on failure instead of throwing.
 - **`Reset-Network`** is the deliberate full-network restart (all 4 validators plus the
@@ -169,12 +174,12 @@ Most of these exist to work around Windows PowerShell 5.1:
 
 1. **Healthy network**: if resetting (plan's `resetNetwork` and no `-NoReset`), the
    network is restarted. Then the health check runs, with fix-ups if needed. If
-   the network still isn't healthy, the run is abandoned before any load is sent. The
-   validator's restart count is read *after* this, so the before/after comparison only
-   covers the load.
+   the network still isn't healthy, the run is abandoned before any load is sent. Each
+   validator's restart count (and node) is read *after* this, so the before/after
+   comparison only covers the load.
 2. **Log streams**: `kubectl logs -f --since-time=<logStartUtc>` runs as a **background
-   process** for the validator (`validator.log`) and for the RPC node spamoor sends to
-   (`rpc.log`, see `rpcPod`).
+   process** for every validator (`validator-<N>.log`) and for the RPC node spamoor sends
+   to (`rpc.log`, see `rpcPod`).
    - `--since-time` backfills everything since the run began: the reset, Besu startup,
      peering and the health check, even if the pod was restarted in between.
    - Streaming matters because kubelet rotates container logs, and a single
@@ -271,24 +276,28 @@ prints a summary that fits on one screen, and saves it as `summary.txt` and in
   Gas/block avg 41.9 Mgas, max 42.0 Mgas = 20.9 Mgas/s; 41.86% of the 100.0 Mgas limit avg, 42.00% max
   Stopping spamoor (6 s after load end; pod delete took 4 s): 3 blocks, 6,000 txs
   Drain after spamoor stopped: 27 blocks, 0 txs (txpool empty when spamoor stopped)
-  Block production (validator-1 proposed 75 of 300 load blocks):
-    ms, after first 2 min (60 blocks)      avg    p50    p95    max
+  Block production (all validators; Produced lines for 300 of 300 load blocks):
+    ms, after first 2 min (240 blocks)     avg    p50    p95    max
     total                                1,498  1,488  1,812  1,892
     txsSelection                           578    576    684    696
       selectedTxsEvaluation                264    264    264    264
     blockAssembled                         120    120    120    120
     blockImported                          800    800  1,100  1,100
     0 ms throughout: duplicateWorldState, preTxsSelection
-    over 2s slot: 0 of 60 (0%); untrimmed total avg 1,648, p95 2,264, over slot 15 of 75
-  Txpool pending on validator-1 (300 of 300 load blocks): avg 34,950, max 49,900, at load end 49,900
+    over 2s slot: 0 of 240 (0%); untrimmed total avg 1,648, p95 2,264, over slot 15 of 300
+  Per validator (more in validators.txt; prop = load blocks proposed, build = ms avg/p95, pend = txpool max/at load end):
+    validator-1  prop 75; build 1,490/1,800 over 0%; pend 49,900/49,900; restarts 0->0; WARN 3 ERROR 0
+    validator-2  prop 75; build 1,510/1,830 over 0%; pend 50,100/50,000; restarts 0->0; WARN 2 ERROR 0
+    validator-3  prop 75; build 1,480/1,790 over 0%; pend 49,800/49,800; restarts 0->0; WARN 0 ERROR 0
+    validator-4  prop 75; build 1,512/1,840 over 0%; pend 50,000/49,900; restarts 0->0; WARN 1 ERROR 0
+  Most common WARN/ERROR across validator logs (whole run):
+        6 x WARN RoundTimer | ...
   Health: healthy after 33 s; fix-ups: none
   CPU cores max (avg) / limit, memory max / limit, during load (! = 95%+ of limit):
     rpc-1        cpu  0.95 (0.70) / 40   mem  1.7Gi / 1.9Gi
     validator-1  cpu  0.98 (0.71) / 40   mem  1.8Gi / 1.9Gi  ! mem 95% of limit
     ...
     spamoor      cpu  3.20 (2.50) / 40   mem  2.1Gi / 160.0Gi
-  validator restarts 0 -> 0; validator.log WARN 3, ERROR 0
-        3 x WARN RoundTimer | ...
   spamoor.log 1.2 MB: error lines 0, warning lines 0
 ```
 
@@ -322,9 +331,10 @@ Where each figure comes from:
   `loadEndUtc` → `spamoorStoppedUtc`, when spamoor was still sending. *Drain* is after
   that, so its txs (and "last txs at +N s") show the txpool emptying with no new load.
   Runs from before `spamoorStoppedUtc` existed count everything as drain.
-- **Block production**: from `validator.log`'s `Produced #N ...` lines, so only the load
-  blocks that validator proposed (about 1 in 4 with 4 validators). Lines are matched to
-  load blocks by block number, not log timestamp. Newer Besu logs the build time
+- **Block production**: from the `Produced #N ...` lines in every validator's log, so
+  each load block is timed by the validator that proposed it, and the table covers
+  (nearly) every load block. Lines are matched to load blocks by block number, not log
+  timestamp. Newer Besu logs the build time
   (`gas in 2.378s`, the `total` row) and `Timing(...)` per phase. Every `name=<n>ms` in
   `Timing(...)` becomes a row, so phases added or renamed in later releases show up
   without a script change. Phases at 0 ms in every block are listed on one line.
@@ -334,17 +344,24 @@ Where each figure comes from:
   to be the Besu block period). Figures are after the first 2 minutes when the load is
   over 3 minutes, with the untrimmed total alongside. Older Besu without timings gets a
   single line saying so.
+- **Per validator**: one line each, from that validator's own log: load blocks it
+  proposed (`prop`, about 1 in 4 with 4 validators), the avg/p95 build time of those
+  blocks and the % over the slot (same 2-minute cut as the table), its txpool max and at
+  load end (`pend`), restart count before → after the load (`RESTARTED MID-RUN` if it
+  changed or its log stream died), and its WARN/ERROR line counts. A validator whose log
+  is missing says `no log`. `validators.txt` has each validator's own timing table,
+  pending avg/max/end and its five most common WARN/ERROR messages.
 - **Txpool pending**: the `N pending` in every `Produced`/`Imported` line (all Besu
-  versions), i.e. the logged validator's txpool size after each load block. A pool still
+  versions), i.e. each validator's txpool size after each load block. A pool still
   growing at load end means the load exceeds what the chain can take.
 - **CPU/memory**: `top.log` samples inside the load window, against the container limits
   in `meta.limits` (`-` if none). Memory limits are converted to Gi, so a decimal `2G`
   shows as `1.9Gi`. Any container whose max reaches 95% of a limit is marked `!` and
   named in the table's notes: near the CPU limit means throttling, near memory means OOM
   risk.
-- **Warnings/errors**: counts of `WARN`/`ERROR` in `validator.log` (the whole run, not
-  just the load), with the three most common messages (numbers and hashes blanked so
-  repeats group). For `spamoor.log`: its size, the count of `level=error` (and `panic:`)
+- **Warnings/errors**: counts of `WARN`/`ERROR` lines in each validator's log (the whole
+  run, not just the load), and the three most common messages across all of them
+  (numbers and hashes blanked so repeats group). For `spamoor.log`: its size, the count of `level=error` (and `panic:`)
   and `level=warning` lines, and the three most common of those messages. It's read in
   one streaming pass because it can be over 1 GB.
 - **spamoor failures**: a retry, or a pod not `Running` at load end, adds a line and a
@@ -353,10 +370,11 @@ Where each figure comes from:
 The end-of-batch table has one row per run: requested and achieved tx/s (also after the
 first 2 minutes), average and max tx/block, Mgas/s, average gas used %, average block time (`Blk s`), the longest gap between
 consecutive load blocks in seconds (`Max gap s`, see above),
-block build time avg/p95 in ms and the % of blocks built over the slot (the logged
-validator's own blocks after the first 2 minutes; empty for Besu without timings), the
-largest txpool pending count on the logged validator during the load (`Max pending`, the
-whole load window; a value close to the txpool's capacity means the pool filled up), the
+block build time avg/p95 in ms and the % of blocks built over the slot (every
+validator's blocks after the first 2 minutes; empty for Besu without timings), the
+largest txpool pending count on any validator during the load and which one
+(`Max pending`, the whole load window; a value close to the txpool's capacity means the
+pool filled up), the
 highest Besu CPU and memory (and which pod), the run's `extraArgs`, and notes such as
 errors, fix-ups, restarts and containers at 95%+ of a limit. If the summary itself
 fails, the run is still packaged and the table row says why. The table is also saved as
@@ -367,14 +385,15 @@ group doesn't overwrite an earlier batch's table), and committed and pushed with
 
 - **`catch`** stores the error message in `meta.error`, and the loop continues.
 - **`finally`** always runs, including on Ctrl+C:
-  - `logStreamDiedEarly` is set to true if the background kubectl had **already exited
-    on its own**. That is the signal that the validator restarted, since the stream dies
-    with the container.
+  - `logStreamDiedEarly` (validator → true/false) is true for a validator whose
+    background kubectl had **already exited on its own**. That is the signal that the
+    validator restarted, since the stream dies with the container.
   - `rpcLogStreamDiedEarly` is the same for `rpc.log` (the RPC node restarted).
   - It then stops the streams, and deletes the spamoor pod if `$spamoorAlive` is still set.
-- **Fallback logs**: if the stream died, it saves `--since-time=logStartUtc` logs from the
-  current container as `validator-fallback.log`. If the restart count also changed, it
-  saves `--previous` as `validator-previous.log`, which is usually where an OOMKill shows up.
+- **Fallback logs**: for each validator whose stream died, it saves
+  `--since-time=logStartUtc` logs from the current container as
+  `validator-<N>-fallback.log`. If that validator's restart count also changed, it saves
+  `--previous` as `validator-<N>-previous.log`, which is usually where an OOMKill shows up.
 - **Packaging**: writes `meta.json` and zips the run folder. If the zip is at most
   `-MaxZipMB`, it's copied into `runs\` (or `runs\<group>\`) and, with `-Push`, committed
   and pushed. A larger zip stays only in `-WorkRoot`.
@@ -387,7 +406,7 @@ value used (0 when skipped).
 
 - The health check has already confirmed peering and block production, so this is extra
   settle time for freshly started JVMs, not a wait for the network to come up.
-- It is recorded in `validator.log` (`healthyUtc` → `loadStartUtc`).
+- It is recorded in the validator logs (`healthyUtc` → `loadStartUtc`).
 - There is no load warmup. The first part of the load window includes spamoor's own
   startup (funding its child wallets before it reaches the requested rate) and Besu's JVM
   warming up under load. This is handled at analysis time by trimming the start of the
@@ -415,4 +434,4 @@ the health check passes after the previous run's cooldown.
    - The restart count reads `containerStatuses[0]`, which assumes the Besu pod has only
      one container.
    - `--since-time` compares the VDS clock with the node's. If the VDS runs ahead, the
-     first few seconds of `validator.log` can be missing.
+     first few seconds of the validator logs can be missing.
